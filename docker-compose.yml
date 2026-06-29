@@ -1,0 +1,36 @@
+# restic rest-server
+# Role: network write-door for remote clients ONLY, in append-only mode.
+# Destructive maintenance (prune / destructive forget / check) does NOT run here --
+# it runs as LOCAL restic, looping over each subrepo /share/Backups/restic/data/<user>, from a cron job.
+
+services:
+  rest-server:
+    image: restic/rest-server:0.14.0      # pin; do not float :latest. Must be the official image.
+    container_name: restic-rest-server
+    restart: unless-stopped
+
+    environment:
+      # --append-only  : clients can add snapshots but never delete or repack
+      # --private-repos: each htpasswd user is confined to its own subrepo, e.g. rest:.../srv01/.
+      #                  Client A cannot read or delete client B's path even with valid creds.
+      #                  NOTE: enabling this fixes each client's repo URL to /<user>/ -- decide
+      #                  before seeding, because changing it later rewrites every client's URL.
+      # --htpasswd-file: keep auth material OUT of the repo dir (the repo is what you mirror/copy).
+      OPTIONS: "--append-only --private-repos --htpasswd-file /auth/.htpasswd"
+      # Auth is REQUIRED because DISABLE_AUTHENTICATION is intentionally left unset. Do not set it.
+
+    volumes:
+      - /share/Backups/restic/data:/data             # private-repos live under here as /data/<user>, e.g. /data/laptop
+      - /share/Backups/restic/auth:/auth:ro          # read-only: a compromised container can't rewrite creds
+
+    ports:
+      - "8000:8000"
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

@@ -1,0 +1,104 @@
+# =============================================================================
+# restic exclude file
+# -----------------------------------------------------------------------------
+# Matching rules (restic):
+#   * A pattern with NO "/" matches that name as a COMPLETE path component at any
+#     depth -- so "node_modules" excludes every node_modules dir anywhere.
+#   * A leading "/" anchors the pattern at the BACKUP ROOT. With BACKUP_PATHS=(/)
+#     that means the real absolute path, so "/var/lib/docker/overlay2" is correct.
+#   * A multi-segment pattern like ".yarn/cache" matches that sequence at any depth.
+#
+#   !!! restic treats a line as a comment ONLY when "#" is the FIRST character.
+#   !!! A trailing/inline comment becomes part of the pattern and silently
+#   !!! matches nothing. EVERY comment below is therefore on its own line.
+#
+# Everything excluded here is a pseudo-filesystem, a cache, or regenerable from a
+# lockfile/manifest. Persistent data is kept.
+# =============================================================================
+
+# ---- Pseudo-filesystems & volatile system dirs (relevant when backing up /) ----
+/proc
+/sys
+/dev
+/run
+/mnt
+/media
+/tmp
+/var/tmp
+/lost+found
+
+# ---- Swap (huge and pointless; lives on / so it IS caught by a (/) backup) ----
+/swapfile
+/swap.img
+
+# ---- Live MySQL/MariaDB data: captured via consistent dumps instead ----
+/var/lib/mysql
+
+# ---- General caches & trash ----
+.cache
+.local/share/Trash
+
+# ---- Node / JS ----
+node_modules
+.npm
+.yarn/cache
+.pnpm-store
+.parcel-cache
+.turbo
+.eslintcache
+.next
+.nuxt
+.svelte-kit
+.angular
+bower_components
+
+# ---- Python ----
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.tox
+.nox
+*.egg-info
+.ipynb_checkpoints
+# Virtualenvs: recreatable from requirements.txt / pyproject.
+# On PRODUCTION servers consider commenting these two out -- a restore that
+# already contains the venv is deterministic and works offline (no PyPI round-trip).
+.venv
+venv
+
+# ---- PHP / Composer ----
+# Composer's cache when COMPOSER_HOME=~/.composer (the XDG default is under .cache).
+.composer/cache
+# Installed deps: recreatable from composer.lock.
+# Same caveat as the venvs -- on production, keeping vendor gives a runnable
+# restore with no "composer install" (network + correct PHP version) on the DR path.
+vendor
+
+# ---- .NET / NuGet ----
+# Global package cache (~/.nuget/packages); regenerable via "dotnet restore".
+# NOTE: the bulk of regenerable .NET output is per-project bin/ and obj/, which are
+# NOT excluded here -- bare "bin"/"obj" would also hit /bin, /usr/bin, node_modules/.bin,
+# etc. If you need them, anchor per host instead, e.g. /home/user/code/**/obj
+.nuget
+
+# ---- Docker (rootful; data-root /var/lib/docker) ----
+# Exclude regenerable image/build state; KEEP volumes (your DB / app data).
+# BuildKit / buildx build cache (the "docker cache"):
+/var/lib/docker/buildkit
+# Image + container layers (re-pulled / rebuilt):
+/var/lib/docker/overlay2
+# Layer metadata:
+/var/lib/docker/image
+# Container configs + writable layers + JSON logs.
+# (Configs are regenerated from your compose files, which live under / and ARE
+# backed up. The logs can be large.)
+/var/lib/docker/containers
+/var/lib/docker/tmp
+# KEPT on purpose: /var/lib/docker/volumes  (named volumes = persistent data).
+# Volumes holding databases you already dump are captured here too, but as a
+# live (torn) copy -- the dump is the consistent source of truth. You may exclude
+# specific DB volume paths if you want to avoid that redundant copy, e.g.:
+# /var/lib/docker/volumes/myapp_db
