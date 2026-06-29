@@ -1,0 +1,84 @@
+# =============================================================================
+# restic backup -- per-host configuration  (SAMPLE / template)
+# -----------------------------------------------------------------------------
+# Copy to ~/.config/restic/config and fill in the values for THIS host:
+#     cp config.sample ~/.config/restic/config
+#     chmod 600 ~/.config/restic/config
+#
+# SECURITY -- the real config holds the REST password, the ntfy token, and the
+# healthchecks ping URL. DO NOT commit the filled-in file. Commit only this
+# .sample (placeholders). Add to .gitignore:   config   encryption-pw
+# (Or keep both out of the repo entirely / encrypt with sops or git-crypt.)
+#
+# This file is sourced by the backup script as plain bash: normal quoting rules
+# apply, and arrays use (parentheses).
+# =============================================================================
+
+# ---- Repository (where backups go) -----------------------------------------
+# rest-server URL. The host is reachable only over the WireGuard tunnel.
+export RESTIC_REPOSITORY="rest:http://10.0.0.2:8000/CHANGE-ME/"
+
+# rest-server HTTP Basic-Auth credentials (NOT the encryption password).
+# IMPORTANT: with rest-server --private-repos, RESTIC_REST_USERNAME MUST equal
+# the first path segment of RESTIC_REPOSITORY, or every request gets 401.
+# e.g. repo ".../-laptop/"  =>  username "laptop".
+export RESTIC_REST_USERNAME="CHANGE-ME"
+export RESTIC_REST_PASSWORD="CHANGE-ME"            # SECRET -- do not commit
+
+# Repository ENCRYPTION password, read from a 0600 file (separate secret, also
+# never committed). This is what actually protects the data at rest.
+export RESTIC_PASSWORD_FILE="$HOME/.config/restic/encryption-pw"
+
+# ---- What to back up --------------------------------------------------------
+# Required, must be non-empty. Whole-system backup = (/).
+BACKUP_PATHS=(/)
+
+# Extra args for `restic backup`. --one-file-system is strongly advised with a
+# (/) backup so restic does not wander into other mounts (USB, network shares,
+# bind mounts) that the exclude file might not cover.
+EXTRA_BACKUP_ARGS=(--one-file-system)
+
+# Exclude file (defaults to $CONFIG_DIR/excludes if unset). `excludes` has no
+# secrets and IS committed to the repo.
+# EXCLUDE_FILE="$HOME/.config/restic/excludes"
+
+# ---- Database dumps ---------------------------------------------------------
+# DB dumps are produced by the pre-backup hook (see ./pre-backup), NOT here; the
+# old DB_NAMES knob is retired. Hosts with no databases simply omit the hook.
+# Defaults: hook = $CONFIG_DIR/pre-backup, dump dir = $CONFIG_DIR/db-dumps.
+# PRE_BACKUP_HOOK="$HOME/.config/restic/pre-backup"
+# DUMP_DIR="$HOME/.config/restic/db-dumps"
+
+# ---- Network gating ---------------------------------------------------------
+# Skip on metered links (cellular cost). TRUE on laptops, FALSE on wired servers.
+SKIP_IF_METERED="true"
+
+# Behaviour when the backend (10.0.0.2) is unreachable -- WireGuard down, or
+# off-LAN with no route:
+#   "false" -> treat as a FAILURE and alert. Right for always-on servers.
+#   "true"  -> skip silently (not a failure). Right for laptops that travel.
+# LAPTOP NOTE: a silent skip sends NO ping, so the healthchecks DMS below will
+# eventually flag the host "late/down" while you are away. For a laptop either
+# set this TRUE and give that check a long grace period, or leave it FALSE and
+# accept one failure alert per run whenever the tunnel is down.
+SKIP_IF_UNREACHABLE="false"
+
+# Reachability probe. Any HTTP response (even 401) counts as "reachable" -- this
+# only tests that the WG route is up, not auth. Point at the rest-server root.
+REST_HEALTH_URL="http://10.0.0.2:8000/"
+
+# ---- Failure notifications (ntfy) -- failure-only; success is silent --------
+# Your ntfy base URL (self-hosted or https://ntfy.sh). No trailing slash.
+NTFY_URL="https://ntfy.example.com"
+NTFY_TOPIC_HIGH="backups-high"                     # topic for urgent failures
+NTFY_TOKEN="CHANGE-ME"                             # SECRET -- do not commit; "" if topic is open
+
+# ---- Dead-man's-switch ping (healthchecks.io or self-hosted) ----------------
+# Script pings $URL/start at begin, $URL on success, $URL/fail on failure. If
+# the pings stop, the service alerts you. Leave empty ("") to disable.
+RESTIC_PING_URL="https://hc-ping.com/CHANGE-ME"    # treat as a secret -- do not commit
+
+# ---- Misc -------------------------------------------------------------------
+# How long `restic backup` waits for a held repo lock (e.g. during maintenance
+# prune on the server) before giving up. Default 15m if unset.
+# LOCK_WAIT="15m"
