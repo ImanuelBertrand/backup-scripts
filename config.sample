@@ -82,3 +82,9 @@ RESTIC_PING_URL="https://hc-ping.com/CHANGE-ME"    # treat as a secret -- do not
 # How long `restic backup` waits for a held repo lock (e.g. during maintenance
 # prune on the server) before giving up. Default 15m if unset.
 # LOCK_WAIT="15m"
+
+# ---- Databases to dump (behaviour defined in the main script) ----
+MARIADB_LOCAL=()      # (ALL) or (db1 db2)              -- local MariaDB/MySQL
+POSTGRES_LOCAL=()     # (ALL) or (db1 db2)              -- local PostgreSQL
+DOCKER_AUTO=()        # (app-mariadb analytics-pg ...)  -- detect + dump everything
+SQLITE_FILES=()       # (name:/path/to.db ...)
