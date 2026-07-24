@@ -1,146 +1,84 @@
 #!/bin/bash
-# pre-backup -- produce database dumps into $DUMP_DIR for the restic backup.
-# ONE template, adapted per host via the "WHAT TO DUMP" block at the bottom.
+# pre-backup -- OPTIONAL per-host hook, run by restic-backup.sh immediately
+# before `restic backup`. EMPTY BY DEFAULT. It exists so a host can prepare
+# something the declarative config cannot express.
 #
-# CONTRACT WITH THE MAIN BACKUP SCRIPT
-#   - Reads $DUMP_DIR from the environment (the main script exports it).
-#   - Writes UNCOMPRESSED dump files into $DUMP_DIR. Uncompressed = restic
-#     dedups well across runs; the main script wipes $DUMP_DIR on exit, so the
-#     plaintext dumps never linger on disk after the snapshot is taken.
-#   - MUST exit non-zero if ANY dump fails. The main script then aborts the
-#     whole backup and alerts -- better no backup than a backup that quietly
-#     contains a half-dumped database.
-#   - Owns nothing else: no restic, no knowledge of the repo, no cleanup of the
-#     backup itself.
+# ROUTINE DATABASE DUMPS DO NOT BELONG HERE. Declare them in the config and the
+# main script dumps them natively:
+#     MARIADB_LOCAL=(ALL)                # or (db1 db2)
+#     POSTGRES_LOCAL=(mydb)              # or (ALL)
+#     DOCKER_AUTO=(app-mariadb)          # detects the engine, dumps everything
+#     SQLITE_FILES=(vaultwarden:/srv/vaultwarden/data/db.sqlite3)
 #
-# PER HOST: edit ONLY the "WHAT TO DUMP" block at the very bottom.
-# Secrets (DB passwords) come from the host ENVIRONMENT, never from argv -- put
-# them in a root-only file and `source` it, or set them in the systemd unit.
+# Use this file only for the leftovers, e.g.:
+#     - an app-specific export with no native support (LDAP, etcd, a REST dump)
+#     - quiescing something first (systemctl stop / docker pause)
+#     - a container whose DB password lives in a HOST secret file rather than in
+#       the container's own environment (DOCKER_AUTO reads the container's env)
+#     - SQLite that exists only inside a container and is not bind-mounted
+#
+# CONTRACT WITH THE MAIN SCRIPT
+#   - $DUMP_DIR is exported by the main script. It exists, is mode 0700, and has
+#     already been emptied. Anything written there is included in the snapshot.
+#   - The main script WIPES $DUMP_DIR on exit. Do NOT clean it yourself -- you
+#     would delete the dumps the native stage just produced -- and do not write
+#     anything here that you expect to survive the run.
+#   - MUST exit non-zero if ANYTHING fails. The main script then aborts the whole
+#     backup and alerts: better no backup than a silently incomplete one.
+#   - Owns nothing else: no restic, no knowledge of the repo, no cleanup.
+#   - Must be installed at $CONFIG_DIR/pre-backup AND be executable, or it is
+#     skipped entirely. Hosts with nothing to prepare just omit the file.
+#
+# Secrets come from the host ENVIRONMENT, never from argv (argv is world-visible
+# in the process list). Put them in a root-only file and `source` it.
 #
 # Standalone test:  DUMP_DIR=/tmp/dumptest ./pre-backup && ls -l /tmp/dumptest
-# ============================================================================
+# =============================================================================
 set -euo pipefail
-umask 077                                  # dumps are plaintext -> 0600 only
+umask 077                                  # artifacts may be plaintext -> 0600
 export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
-DUMP_DIR="${DUMP_DIR:-$HOME/.config/restic/db-dumps}"
+DUMP_DIR="${DUMP_DIR:-$HOME/.config/restic/db-dumps}"   # default is for standalone runs only
 mkdir -p "$DUMP_DIR"; chmod 700 "$DUMP_DIR"
 
 log() { printf '%s pre-backup: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*"; }
 die() { log "ERROR: $*"; exit 1; }
 
-# Clear our own prior artifacts (idempotent; also covers a crash that skipped
-# the main script's exit-time wipe). Touches only our own file types.
-rm -f "${DUMP_DIR:?}"/*.sql "${DUMP_DIR:?}"/*.tmp 2>/dev/null || true
-# Drop any half-written temp file if we die mid-dump.
-trap 'rm -f "${DUMP_DIR:?}"/*.tmp 2>/dev/null || true' EXIT
-
-slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }   # safe filename frag
-
-# dump_to <name> <command...>
-# Runs the command, sends its STDOUT to $DUMP_DIR/<name>.sql atomically.
-# stderr is left to flow to our stderr (captured by the main script on failure).
+# dump_to <name> <command...>  -- the one primitive worth keeping.
+# Runs the command, captures STDOUT to $DUMP_DIR/<name>.out atomically, and fails
+# loudly on a non-zero exit OR empty output (a silently truncated dump is the
+# failure mode this whole script exists to prevent). Prefer UNCOMPRESSED output:
+# restic dedups it well across runs, and $DUMP_DIR never outlives the snapshot.
+# stderr is left to flow to our stderr, which the main script captures on failure.
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 dump_to() {
   local name; name="$(slug "$1")"; shift
-  local out="$DUMP_DIR/$name.sql" tmp="$DUMP_DIR/$name.sql.tmp"
-  log "dumping -> $name.sql"
-  "$@" >"$tmp" || die "dump '$name' failed (exit $?)"
-  [[ -s "$tmp" ]] || die "dump '$name' produced an empty file"
+  local out="$DUMP_DIR/$name.out" tmp="$DUMP_DIR/$name.out.tmp"
+  log "writing -> $(basename "$out")"
+  "$@" >"$tmp" || die "'$name' failed (exit $?)"
+  [[ -s "$tmp" ]] || die "'$name' produced an empty file"
   mv -f "$tmp" "$out"
 }
 
-# ============================================================================
-# HELPERS -- keep the ones your hosts need, delete the rest.
-# ============================================================================
-
-# Local MariaDB/MySQL over the unix socket. Credentials from ~/.my.cnf
-# ([client] or [mariadb-dump] section). One file per DB for clean dedup.
-# NOTE: --single-transaction only gives a consistent snapshot for transactional
-# (InnoDB) tables; MyISAM tables are NOT consistent under it.
-# --routines --events are added so stored procs / scheduled events survive a
-# restore (NOT dumped by default); drop them if you don't use them.
-dump_mariadb_local() {                       # dump_mariadb_local db [db ...]
-  local db
-  for db in "$@"; do
-    dump_to "mariadb-$db" \
-      mariadb-dump --single-transaction --quick --routines --events "$db"
-  done
-}
-
-# MariaDB/MySQL inside a docker container.
-# Password (if needed) is read from host env var MARIADB_PW and forwarded into
-# the container BY NAME ONLY (`-e MYSQL_PWD`), so it never appears in the host
-# process list. If the container image already carries credentials (e.g. a
-# baked-in /root/.my.cnf), leave MARIADB_PW unset and it's omitted entirely.
-dump_mariadb_docker() {                      # dump_mariadb_docker container user db [db ...]
-  local cont="$1" user="$2"; shift 2
-  local db pwflag=()
-  if [[ -n "${MARIADB_PW:-}" ]]; then export MYSQL_PWD="$MARIADB_PW"; pwflag=(-e MYSQL_PWD); fi
-  for db in "$@"; do
-    dump_to "mariadb@$cont-$db" \
-      docker exec "${pwflag[@]}" "$cont" \
-        mariadb-dump --single-transaction --quick --routines --events -u"$user" "$db"
-  done
-  unset MYSQL_PWD
-}
-
-# Local PostgreSQL. Assumes this script runs as root (or with NOPASSWD sudo);
-# `sudo -n` fails fast rather than hanging on a password prompt under cron.
-# Globals (roles/tablespaces) dumped once; then one self-contained file per DB.
-dump_postgres_local() {                      # dump_postgres_local db [db ...]
-  dump_to "pg-globals" sudo -n -u postgres pg_dumpall --globals-only
-  local db
-  for db in "$@"; do
-    dump_to "pg-$db" sudo -n -u postgres pg_dump --create "$db"
-  done
-}
-
-# PostgreSQL inside a docker container.
-# Set host env POSTGRES_PW only if the container uses password auth; with the
-# official image's default trust auth for local connections you can omit it.
-dump_postgres_docker() {                     # dump_postgres_docker container user db [db ...]
-  local cont="$1" user="$2"; shift 2
-  local db pwflag=()
-  if [[ -n "${POSTGRES_PW:-}" ]]; then export PGPASSWORD="$POSTGRES_PW"; pwflag=(-e PGPASSWORD); fi
-  dump_to "pg@$cont-globals" \
-    docker exec "${pwflag[@]}" "$cont" pg_dumpall -U "$user" --globals-only
-  for db in "$@"; do
-    dump_to "pg@$cont-$db" \
-      docker exec "${pwflag[@]}" "$cont" pg_dump -U "$user" --create "$db"
-  done
-  unset PGPASSWORD
-}
-
-# SQLite on the host filesystem (e.g. a bind-mounted container volume).
-# `.dump` yields a CONSISTENT SQL text snapshot via SQLite's online reader --
-# safe while the app is writing (handles WAL), and dedups far better than the
-# raw binary file. For multi-GB/very busy DBs, `.backup` to a file is gentler
-# (binary, less dedup): sqlite3 "$path" ".backup '$DUMP_DIR/name.sqlite'".
-dump_sqlite() {                              # dump_sqlite name /path/to/app.db
-  local name="$1" path="$2"
-  [[ -r "$path" ]] || die "sqlite db not readable: $path"
-  dump_to "sqlite-$name" sqlite3 "$path" .dump
-}
-
-# SQLite inside a container (only if the container actually ships sqlite3).
-dump_sqlite_docker() {                       # dump_sqlite_docker container name /path/in/container.db
-  local cont="$1" name="$2" path="$3"
-  dump_to "sqlite@$cont-$name" docker exec "$cont" sqlite3 "$path" .dump
-}
-
-# ============================================================================
-# WHAT TO DUMP  --  the ONLY part you edit per host. Comment out the rest.
+# =============================================================================
+# WHAT TO PREPARE  --  the ONLY part you edit per host. Empty = nothing to do.
+#
+# Examples (all commented out; delete or adapt):
+#
+#   # SQLite that lives only inside a container:
+#   dump_to "grafana" docker exec grafana sqlite3 /var/lib/grafana/grafana.db .dump
+#
+#   # Container DB whose password comes from a host secret, forwarded BY NAME so
+#   # it never reaches the host process list:
+#   export MYSQL_PWD="$(cat /root/.secrets/mariadb_pw)"
+#   dump_to "appdb" docker exec -e MYSQL_PWD app-mariadb \
+#       mariadb-dump --single-transaction --quick --routines --events -uroot appdb
+#   unset MYSQL_PWD
+#
+#   # Something that is not a database at all:
+#   dump_to "ldap" slapcat -n 1
+#
 # List running containers:  docker ps --format '{{.Names}}\t{{.Image}}'
-# ============================================================================
+# =============================================================================
 
-# --- plain DB host (this replaces the old inline DB_NAMES loop) -------------
-# dump_mariadb_local  appdb  wordpress
-
-# --- the docker host -------------------------------------------------------
-# export MARIADB_PW="$(cat /root/.secrets/mariadb_pw)"     # if password auth
-# dump_mariadb_docker    app-mariadb   root      appdb
-# dump_postgres_docker   analytics-pg  postgres  analytics
-# dump_sqlite            vaultwarden   /srv/vaultwarden/data/db.sqlite3
-# dump_sqlite_docker     grafana       grafana   /var/lib/grafana/grafana.db
-
-log "all dumps complete."
+log "hook finished."

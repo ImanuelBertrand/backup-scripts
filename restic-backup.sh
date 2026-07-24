@@ -38,7 +38,6 @@ source "$CONFIG_DIR/config"
 # ---- Defaults + required-value guards ----
 declare -p BACKUP_PATHS &>/dev/null || { echo "FATAL: BACKUP_PATHS not set in config" >&2; exit 1; }
 (( ${#BACKUP_PATHS[@]} )) || { echo "FATAL: BACKUP_PATHS is empty" >&2; exit 1; }
-declare -p DB_NAMES &>/dev/null || DB_NAMES=()
 declare -p EXTRA_BACKUP_ARGS &>/dev/null || EXTRA_BACKUP_ARGS=()  # e.g. (--one-file-system)
 EXCLUDE_FILE="${EXCLUDE_FILE:-$CONFIG_DIR/excludes}"
 DUMP_DIR="${DUMP_DIR:-$CONFIG_DIR/db-dumps}"
@@ -252,12 +251,16 @@ fi
 ping_dms "$PING_URL/start"
 
 # ============================================================================
-#  DUMP STAGE  --  native DB dumps into $DUMP_DIR (selected by the config
-#  arrays above), plus an optional pre-backup hook as an escape hatch. The dir
-#  is added to the backup set and WIPED on exit so plaintext never lingers. Any
-#  dump failure aborts the whole run (better no backup than a half-dumped DB).
+#  DUMP STAGE  --  native DB dumps into $DUMP_DIR (selected by the config arrays
+#  above), then the optional pre-backup hook for anything the config cannot
+#  express. The dir is added to the backup set and WIPED on exit so plaintext
+#  never lingers. Any failure aborts the whole run (better no backup than a
+#  half-dumped DB).
+#
+#  ORDER MATTERS: the hook runs AFTER the native dumps and writes into the same
+#  directory, so the hook must never clear $DUMP_DIR itself -- see ./pre-backup.
 # ============================================================================
-PRE_BACKUP_HOOK="${PRE_BACKUP_HOOK:-$CONFIG_DIR/pre-backup}"   # optional escape hatch
+PRE_BACKUP_HOOK="${PRE_BACKUP_HOOK:-$CONFIG_DIR/pre-backup}"   # optional generic hook
 cleanup_dumps() { rm -rf "${DUMP_DIR:?}"/* 2>/dev/null || true; }
 if _have_db_config || [[ -x "$PRE_BACKUP_HOOK" ]]; then
   mkdir -p "$DUMP_DIR"; chmod 700 "$DUMP_DIR"
@@ -267,7 +270,9 @@ if _have_db_config || [[ -x "$PRE_BACKUP_HOOK" ]]; then
   run_db_dumps
   umask "$__um"
   [[ -x "$PRE_BACKUP_HOOK" ]] && { export DUMP_DIR; run_step "pre-backup-hook" "$PRE_BACKUP_HOOK"; }
-  compgen -G "$DUMP_DIR/*.sql" >/dev/null && BACKUP_PATHS+=("$DUMP_DIR")
+  # Any artifact counts, not just *.sql -- the hook is generic and may write
+  # anything. (A failing compgen here is exempt from set -e: it precedes the &&.)
+  compgen -G "$DUMP_DIR/*" >/dev/null && BACKUP_PATHS+=("$DUMP_DIR")
 fi
 
 # ---- Self-heal stale locks in this client's subrepo (stale-only; safe) ----
