@@ -42,10 +42,32 @@ EXTRA_BACKUP_ARGS=(--one-file-system)
 # secrets and IS committed to the repo.
 # EXCLUDE_FILE="$HOME/.config/restic/excludes"
 
-# ---- Database dumps ---------------------------------------------------------
-# DB dumps are produced by the pre-backup hook (see ./pre-backup), NOT here; the
-# old DB_NAMES knob is retired. Hosts with no databases simply omit the hook.
-# Defaults: hook = $CONFIG_DIR/pre-backup, dump dir = $CONFIG_DIR/db-dumps.
+# ---- Database dumps (declarative) -------------------------------------------
+# Declare databases here and the main script dumps them natively, before the
+# backup, into $DUMP_DIR -- which is added to the backup set and wiped on exit,
+# so the plaintext never lingers. ANY dump failure aborts the whole run.
+#
+# A host with no databases just leaves all four arrays empty.
+#
+#   ALL      -> ONE combined dump (mariadb-dump --all-databases / pg_dumpall).
+#   db names -> one file per database (dedups better; restore individually).
+#
+# Credentials: local MariaDB via ~/.my.cnf, local PostgreSQL via `sudo -n -u
+# postgres` (peer auth), and DOCKER_AUTO from each container's OWN environment
+# (MARIADB_ROOT_PASSWORD / MYSQL_ROOT_PASSWORD / POSTGRES_PASSWORD) -- so a
+# password is never visible in the host process list.
+
+MARIADB_LOCAL=()      # (ALL) or (db1 db2)              -- local MariaDB/MySQL
+POSTGRES_LOCAL=()     # (ALL) or (db1 db2)              -- local PostgreSQL
+DOCKER_AUTO=()        # (app-mariadb analytics-pg ...)  -- name the CONTAINER only:
+                      #   the engine is detected inside it and EVERYTHING is dumped
+SQLITE_FILES=()       # (name:/path/to.db ...)          -- host path, incl. bind mounts
+
+# ---- Pre-backup hook (optional escape hatch) --------------------------------
+# For anything the arrays above cannot express: a container-only SQLite file, a
+# DB password kept in a host secret file, quiescing a service, a non-DB export.
+# See ./pre-backup. Skipped unless the file exists AND is executable, so hosts
+# with nothing to prepare simply omit it. Runs AFTER the native dumps.
 # PRE_BACKUP_HOOK="$HOME/.config/restic/pre-backup"
 # DUMP_DIR="$HOME/.config/restic/db-dumps"
 
@@ -82,9 +104,3 @@ RESTIC_PING_URL="https://hc-ping.com/CHANGE-ME"    # treat as a secret -- do not
 # How long `restic backup` waits for a held repo lock (e.g. during maintenance
 # prune on the server) before giving up. Default 15m if unset.
 # LOCK_WAIT="15m"
-
-# ---- Databases to dump (behaviour defined in the main script) ----
-MARIADB_LOCAL=()      # (ALL) or (db1 db2)              -- local MariaDB/MySQL
-POSTGRES_LOCAL=()     # (ALL) or (db1 db2)              -- local PostgreSQL
-DOCKER_AUTO=()        # (app-mariadb analytics-pg ...)  -- detect + dump everything
-SQLITE_FILES=()       # (name:/path/to.db ...)
