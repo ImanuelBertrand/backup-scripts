@@ -57,7 +57,10 @@ NTFY_TOPIC_HIGH="${NTFY_TOPIC_HIGH:-backups-high}"
 # vanished" from "every database dump was unreadable", so it must not be silent
 # by default. Set it to a separate topic to split the channels, or to "" to
 # downgrade these to journal-only.
-NTFY_TOPIC_LOW="${NTFY_TOPIC_LOW:-$NTFY_TOPIC_HIGH}"
+# NOTE the "-" without a colon: it must distinguish "not set in config" (fall
+# back to the failure topic) from an explicit NTFY_TOPIC_LOW="" (journal-only).
+# ${VAR:-default} would treat both as unset and ignore the "" opt-out.
+NTFY_TOPIC_LOW="${NTFY_TOPIC_LOW-$NTFY_TOPIC_HIGH}"
 NTFY_TOKEN="${NTFY_TOKEN:-}"
 PING_URL="${RESTIC_PING_URL:-}"
 
