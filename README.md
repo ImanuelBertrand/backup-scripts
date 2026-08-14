@@ -33,7 +33,9 @@ only place with delete rights.
 | `config.sample` | client, → `~/.config/restic/config` | Per-host settings **and secrets**. Never commit the filled-in copy. |
 | `excludes` | client, → `~/.config/restic/excludes` | Shared exclude patterns. No secrets; committed. |
 | `pre-backup` | client, → `~/.config/restic/pre-backup` | **Optional** hook for what the config can't express. Omit if unneeded. |
+| `pre-backup-magento-docker.sh` | client, → `~/.config/restic/pre-backup` | A **ready-made** hook for a Magento 2 MariaDB in Docker. See §5.4. |
 | `docker-compose.yml` | backup host | The rest-server. |
+| `.gitignore` | this repo | Keeps the filled-in `config` and `encryption-pw` out of git. |
 
 ## Prerequisites
 
@@ -105,6 +107,19 @@ curl -i http://10.0.0.2:8000/          # 401 is the CORRECT answer -- auth is on
 A `401` means reachable and authenticating. A timeout means the tunnel is down.
 If you get `200` without credentials, `DISABLE_AUTHENTICATION` leaked in
 somewhere — stop and fix it before seeding any data.
+
+> **The port is bound to the WireGuard address on purpose.** `docker-compose.yml`
+> publishes `10.0.0.2:8000:8000`, not `8000:8000`. Docker's iptables rules sit
+> *ahead* of ufw/firewalld's `INPUT` chain, so a bare `8000:8000` would expose the
+> repo on every interface — plaintext HTTP with only htpasswd in front — and your
+> host firewall would **not** stop it. The "no TLS, no proxy" design depends on
+> this. Change `10.0.0.2` if the backup host's WG address differs, and verify
+> from off-tunnel that the port is closed:
+>
+> ```bash
+> ss -ltnp | grep 8000                  # on the backup host: should show 10.0.0.2:8000
+> curl -m 5 http://<LAN-or-public-IP>:8000/    # from elsewhere: must NOT answer
+> ```
 
 > **Decide `--private-repos` before seeding.** It fixes every client's repo URL
 > to `/<user>/`. Changing it later rewrites every client's URL.
@@ -326,11 +341,52 @@ DUMP_DIR=/tmp/dumptest /root/.config/restic/pre-backup && ls -l /tmp/dumptest
 ### 5.3 Verify a dump is actually usable
 
 Do this once per database, and after any change. A dump you have never restored
-is a hypothesis:
+is a hypothesis — and `head`ing the file only proves it exists. Actually feed it
+to a throwaway database:
 
 ```bash
-restic dump latest /root/.config/restic/db-dumps/mariadb-all.sql | head -50
+# 1. It's in the snapshot and not truncated:
+restic dump latest /root/.config/restic/db-dumps/mariadb-all.sql | tail -5
+#    a complete mariadb-dump ends with "-- Dump completed on ..."
+
+# 2. It restores. Throwaway container, nothing on the real server touched:
+docker run --rm -d --name dumptest -e MARIADB_ROOT_PASSWORD=test mariadb:11
+sleep 20
+restic dump latest /root/.config/restic/db-dumps/mariadb-all.sql \
+  | docker exec -i -e MYSQL_PWD=test dumptest mariadb -uroot
+docker exec -e MYSQL_PWD=test dumptest mariadb -uroot -e "SHOW DATABASES; \
+  SELECT COUNT(*) FROM <yourdb>.<a_table_you_know>;"
+docker rm -f dumptest
 ```
+
+A non-zero exit from the import, or a row count of 0 where you expected data, is
+the whole point of the exercise.
+
+### 5.4 Magento 2 in Docker (`pre-backup-magento-docker.sh`)
+
+Magento's indexers build into `*_replica` tables and swap them in with
+`RENAME TABLE`. That DDL invalidates `mariadb-dump --single-transaction`
+mid-dump (`Error 1412: Table definition has changed`), so `DOCKER_AUTO` on a
+Magento container fails intermittently. This hook dumps the **schema** of
+everything and the **data** of everything except the volatile index tables:
+
+```bash
+install -m 700 pre-backup-magento-docker.sh /root/.config/restic/pre-backup
+```
+
+Then edit the one line at the bottom to name your container:
+
+```bash
+dump_magento_docker my-magento-db-1       # database auto-detected if it's the only one
+```
+
+Keep that container **out of** `DOCKER_AUTO` — otherwise it gets dumped twice,
+once by the path that hits error 1412. Other databases on the host can stay
+declarative; the hook writes alongside them and no longer touches their files.
+
+> **Restore:** run `bin/magento indexer:reindex` after importing. The index
+> tables come back empty by design. The `session` table is also skipped, so
+> everyone is logged out — harmless, but expect it.
 
 ---
 
@@ -397,6 +453,7 @@ can read a repo given those three, which is why §3.2 matters.
 | Channel | When | Notes |
 |---|---|---|
 | ntfy (`urgent`) | Failure only | Success is intentionally silent. |
+| ntfy (`default`) | Non-fatal warnings | Only if you set `NTFY_TOPIC_LOW`. Currently: restic exit 3. |
 | healthchecks ping | `/start`, success, `/fail` | Catches the case where the script never runs at all. |
 | `notify-send` | Failure, desktop only | Best-effort. |
 
@@ -416,6 +473,7 @@ monitoring is only as good as the last time you proved the alarm works.
 | `Another run holds the lock; exiting.` | A previous run is still going (`flock`). Not an error. |
 | Backup skipped, no alert | Metered link, or `SKIP_IF_UNREACHABLE="true"`. By design; no ping is sent. |
 | Dump fails, whole backup aborts | Intended. Fix the dump — don't disable the check. |
+| `WARNING during 'backup' (exit 3)` | restic ≥ 0.17: the snapshot **was** written, but some source files couldn't be read (sockets, files that vanished mid-run). Tolerated on purpose — the success ping still fires. Read the log to see which paths. |
 | `no mariadb-dump/pg_dumpall in container` | `DOCKER_AUTO` on a SQLite container. Use `SQLITE_FILES` with the host path, or the hook. |
 | Alert fires but no desktop popup | `notify-send` from a root systemd unit can't reach your session. The ntfy message is the real channel. |
 | Exclude pattern silently ignored | restic treats `#` as a comment **only** at the start of a line. An inline comment becomes part of the pattern. |
@@ -439,5 +497,6 @@ encryption password and has delete rights on every repo. If that matters for
 your threat model, split retention per client or keep an off-site copy the
 maintenance host cannot reach.
 
-If you ever keep a filled-in `config` inside a git repo, add a `.gitignore` with
-`config` and `encryption-pw` first — or better, keep them out of git entirely.
+A `.gitignore` covering `config` and `encryption-pw` ships with this repo, but it
+only protects files that keep those exact names. Best is still to keep secrets
+out of git entirely, or encrypt them with sops / git-crypt.

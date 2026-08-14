@@ -1,5 +1,8 @@
 #!/bin/bash
-set -euo pipefail
+# -E (errtrace) is REQUIRED, not cosmetic: without it the ERR trap below is
+# NOT inherited by shell functions, so a failure inside db_dump_to / run_db_dumps
+# would kill the run with no ntfy alert at all.
+set -Eeuo pipefail
 
 # ============================================================================
 # restic CLIENT backup -- ONE script for every client (servers AND laptop).
@@ -48,6 +51,9 @@ SKIP_IF_UNREACHABLE="${SKIP_IF_UNREACHABLE:-false}"
 # ntfy (failure-only; success is intentionally silent)
 NTFY_URL="${NTFY_URL:-}"
 NTFY_TOPIC_HIGH="${NTFY_TOPIC_HIGH:-backups-high}"
+# Optional second topic for NON-fatal warnings (e.g. restic exit 3: snapshot was
+# written but some source files were unreadable). Empty => log only, no push.
+NTFY_TOPIC_LOW="${NTFY_TOPIC_LOW:-}"
 NTFY_TOKEN="${NTFY_TOKEN:-}"
 PING_URL="${RESTIC_PING_URL:-}"
 
@@ -57,6 +63,10 @@ ping_dms() { [[ -n "$PING_URL" ]] || return 0; curl -fsS -m 10 --retry 3 "$1" >/
 
 ntfy() {
   local topic="$1" priority="$2" tags="$3" title="$4" body="$5"
+  # Notifications are optional: with no NTFY_URL (or no topic) there is nothing
+  # to send to, and firing curl at "/$topic" would just log a spurious WARN on
+  # every single failure for hosts that deliberately disabled ntfy.
+  [[ -n "$NTFY_URL" && -n "$topic" ]] || return 0
   local args=(-H "Title: $title" -H "Priority: $priority" -H "Tags: $tags")
   [[ -n "$NTFY_TOKEN" ]] && args+=(-H "Authorization: Bearer $NTFY_TOKEN")
   curl -fsS -m 15 --retry 3 "${args[@]}" --data-binary "$body" \
@@ -76,21 +86,61 @@ $(printf '%s' "$output" | tail -c 1500)"
     && notify-send -u critical "restic backup failed" "$stage (exit $code)" 2>/dev/null || true
 }
 
+notify_warning() {
+  local stage="$1" code="$2" output="$3"
+  ntfy "$NTFY_TOPIC_LOW" default warning \
+    "Backup WARNING on $(hostname) ($stage)" \
+"Host:  $(hostname)
+Stage: $stage
+Exit:  $code
+$(printf '%s' "$output" | tail -c 1500)"
+}
+
+# run_step [-t "<codes>"] <stage> <cmd...>
+#   -t lists exit codes that are a WARNING, not a failure: they are logged (and
+#   pushed to NTFY_TOPIC_LOW if configured) and the run CONTINUES, so the success
+#   ping still fires. Everything else aborts and alerts, as before.
 run_step() {
+  local tolerate=""
+  [[ "${1:-}" == "-t" ]] && { tolerate="$2"; shift 2; }
   local stage="$1"; shift
   log ">>> $stage"
-  set +e
+  # `set +e` does NOT silence an ERR trap, so the trap must be disarmed too --
+  # otherwise on_unexpected_error pre-empts the per-stage notification below and
+  # the tolerated-exit-code check never runs. Re-armed immediately after.
+  trap - ERR; set +e
   local out; out="$("$@" 2>&1)"; local rc=$?
-  set -e
+  set -e; arm_err_trap
   printf '%s\n' "$out"
   if (( rc != 0 )); then
+    if [[ -n "$tolerate" && " $tolerate " == *" $rc "* ]]; then
+      log "WARNING during '$stage' (exit $rc) -- tolerated, continuing"
+      notify_warning "$stage" "$rc" "$out"
+      return 0
+    fi
     log "ERROR during '$stage' (exit $rc)"
     notify_failure "$stage" "$rc" "$out"
     exit "$rc"
   fi
 }
 
-trap 'rc=$?; log "ERROR: unexpected failure (line $LINENO, exit $rc)"; notify_failure script "$rc" "see journal/log"; exit $rc' ERR
+# Catch-all for failures that are NOT wrapped in run_step / db_dump_to. With
+# `set -E` above this now also covers failures inside functions, which is the
+# whole point -- previously such a failure killed the run with NO alert at all.
+#
+# It is a named function so the two blocks that deliberately capture a non-zero
+# exit can disarm it (`trap - ERR`) and put it back (`arm_err_trap`).
+# ${BASH_LINENO[0]} is the failing line; plain $LINENO would report this
+# handler's own line instead.
+on_unexpected_error() {
+  local rc=$?
+  trap - ERR                     # never re-enter, even if notify_failure fails
+  log "ERROR: unexpected failure (line ${BASH_LINENO[0]}, exit $rc)"
+  notify_failure script "$rc" "see journal/log"
+  exit "$rc"
+}
+arm_err_trap() { trap on_unexpected_error ERR; }
+arm_err_trap
 
 # ============================================================================
 #  DATABASE DUMPS  --  per-host SELECTION lives in the config via these arrays:
@@ -115,7 +165,11 @@ db_dump_to() {
   local name; name="$(_slug "$1")"; shift
   local out="$DUMP_DIR/$name.sql" tmp="$DUMP_DIR/$name.sql.tmp" err="$DUMP_DIR/$name.sql.err"
   log ">>> dump $name"
-  set +e; "$@" >"$tmp" 2>"$err"; local rc=$?; set -e
+  # Same as run_step: disarm the ERR trap around the deliberate failure capture,
+  # or it fires first and we lose the "dump:$name" stage in the alert.
+  trap - ERR; set +e
+  "$@" >"$tmp" 2>"$err"; local rc=$?
+  set -e; arm_err_trap
   if (( rc != 0 )) || [[ ! -s "$tmp" ]]; then
     local why; if (( rc != 0 )); then why="exit $rc"; else why="empty output"; rc=1; fi
     local msg; msg="$(tail -c 800 "$err" 2>/dev/null)"
@@ -279,7 +333,12 @@ fi
 run_step "unlock" restic unlock
 
 # ---- Backup ----
-run_step "backup" restic backup \
+# -t 3: restic >= 0.17 exits 3 when the snapshot WAS written but some source
+# files could not be read. On a live BACKUP_PATHS=(/) that is routine (sockets,
+# files that vanish mid-run), so treating it as fatal would fire an urgent alert
+# AND leave the dead-man's switch un-pinged for a backup that actually succeeded.
+# It is still surfaced: logged, and pushed to NTFY_TOPIC_LOW if you set one.
+run_step -t "3" "backup" restic backup \
   --retry-lock "$LOCK_WAIT" \
   --exclude-caches \
   --exclude-file "$EXCLUDE_FILE" \

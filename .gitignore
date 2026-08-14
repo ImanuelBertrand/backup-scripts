@@ -1,0 +1,22 @@
+# =============================================================================
+# Never commit the filled-in per-host files. Only the *.sample template belongs
+# in git. See README "Client setup".
+# =============================================================================
+
+# The real config: holds the rest-server password, the ntfy token and the
+# healthchecks ping URL.
+config
+
+# Repository encryption password. If this leaks, the backups are readable; if it
+# is lost, they are not recoverable at all.
+encryption-pw
+
+# Plaintext database dumps + the single-instance lock, in case someone points
+# CONFIG_DIR at a checkout of this repo.
+db-dumps/
+.lock
+
+# Stray key material.
+*.key
+*.pem
+*.htpasswd

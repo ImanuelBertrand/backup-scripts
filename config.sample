@@ -7,8 +7,9 @@
 #
 # SECURITY -- the real config holds the REST password, the ntfy token, and the
 # healthchecks ping URL. DO NOT commit the filled-in file. Commit only this
-# .sample (placeholders). Add to .gitignore:   config   encryption-pw
-# (Or keep both out of the repo entirely / encrypt with sops or git-crypt.)
+# .sample (placeholders). The repo's .gitignore already covers `config` and
+# `encryption-pw`, but that only helps if the file keeps those exact names --
+# better still, keep both out of the repo entirely (or use sops / git-crypt).
 #
 # This file is sourced by the backup script as plain bash: normal quoting rules
 # apply, and arrays use (parentheses).
@@ -94,6 +95,12 @@ REST_HEALTH_URL="http://10.0.0.2:8000/"
 NTFY_URL="https://ntfy.example.com"
 NTFY_TOPIC_HIGH="backups-high"                     # topic for urgent failures
 NTFY_TOKEN="CHANGE-ME"                             # SECRET -- do not commit; "" if topic is open
+
+# Optional second topic for NON-fatal warnings. Currently used for restic exit 3
+# ("snapshot written, but some source files could not be read") -- common on a
+# whole-system (/) backup and NOT a reason to page anyone. Leave unset/empty to
+# log those to the journal only.
+# NTFY_TOPIC_LOW="backups-low"
 
 # ---- Dead-man's-switch ping (healthchecks.io or self-hosted) ----------------
 # Script pings $URL/start at begin, $URL on success, $URL/fail on failure. If

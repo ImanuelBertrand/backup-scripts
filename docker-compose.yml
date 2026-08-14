@@ -24,7 +24,16 @@ services:
       - /share/Backups/restic/auth:/auth:ro          # read-only: a compromised container can't rewrite creds
 
     ports:
-      - "8000:8000"
+      # Bind to the WireGuard address ONLY. A bare "8000:8000" listens on
+      # 0.0.0.0, and Docker's own iptables rules sit AHEAD of ufw/firewalld's
+      # INPUT chain -- so a host firewall does NOT contain it, and the repo would
+      # be reachable from every interface with only htpasswd over plaintext HTTP
+      # in front of it. The whole "no TLS, no proxy" design depends on this line.
+      #
+      # 10.0.0.2 must be this host's WG address. If the wg interface comes up
+      # after Docker the bind fails; `restart: unless-stopped` retries, or order
+      # the unit After=wg-quick@wg0.service.
+      - "10.0.0.2:8000:8000"
 
     security_opt:
       - no-new-privileges:true
