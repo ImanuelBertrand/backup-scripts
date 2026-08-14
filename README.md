@@ -453,7 +453,7 @@ can read a repo given those three, which is why §3.2 matters.
 | Channel | When | Notes |
 |---|---|---|
 | ntfy (`urgent`) | Failure only | Success is intentionally silent. |
-| ntfy (`default`) | Non-fatal warnings | Only if you set `NTFY_TOPIC_LOW`. Currently: restic exit 3. |
+| ntfy (`default`) | Non-fatal warnings | Currently: restic exit 3. Goes to `NTFY_TOPIC_HIGH` unless you set `NTFY_TOPIC_LOW`; `""` makes it journal-only. |
 | healthchecks ping | `/start`, success, `/fail` | Catches the case where the script never runs at all. |
 | `notify-send` | Failure, desktop only | Best-effort. |
 
@@ -473,7 +473,7 @@ monitoring is only as good as the last time you proved the alarm works.
 | `Another run holds the lock; exiting.` | A previous run is still going (`flock`). Not an error. |
 | Backup skipped, no alert | Metered link, or `SKIP_IF_UNREACHABLE="true"`. By design; no ping is sent. |
 | Dump fails, whole backup aborts | Intended. Fix the dump — don't disable the check. |
-| `WARNING during 'backup' (exit 3)` | restic ≥ 0.17: the snapshot **was** written, but some source files couldn't be read (sockets, files that vanished mid-run). Tolerated on purpose — the success ping still fires. Read the log to see which paths. |
+| `WARNING during 'backup' (exit 3)` | restic ≥ 0.17: the snapshot **was** written, but some source files couldn't be read (sockets, files that vanished mid-run). Tolerated on purpose — the success ping still fires. **Read the log to see which paths**: exit 3 looks identical whether one socket vanished or every DB dump was unreadable. |
 | `no mariadb-dump/pg_dumpall in container` | `DOCKER_AUTO` on a SQLite container. Use `SQLITE_FILES` with the host path, or the hook. |
 | Alert fires but no desktop popup | `notify-send` from a root systemd unit can't reach your session. The ntfy message is the real channel. |
 | Exclude pattern silently ignored | restic treats `#` as a comment **only** at the start of a line. An inline comment becomes part of the pattern. |

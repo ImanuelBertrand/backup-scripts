@@ -51,9 +51,13 @@ SKIP_IF_UNREACHABLE="${SKIP_IF_UNREACHABLE:-false}"
 # ntfy (failure-only; success is intentionally silent)
 NTFY_URL="${NTFY_URL:-}"
 NTFY_TOPIC_HIGH="${NTFY_TOPIC_HIGH:-backups-high}"
-# Optional second topic for NON-fatal warnings (e.g. restic exit 3: snapshot was
-# written but some source files were unreadable). Empty => log only, no push.
-NTFY_TOPIC_LOW="${NTFY_TOPIC_LOW:-}"
+# Topic for NON-fatal warnings (e.g. restic exit 3: snapshot was written but some
+# source files were unreadable). Defaults to the SAME topic as failures, at
+# "default" priority instead of "urgent" -- exit 3 does not distinguish "a socket
+# vanished" from "every database dump was unreadable", so it must not be silent
+# by default. Set it to a separate topic to split the channels, or to "" to
+# downgrade these to journal-only.
+NTFY_TOPIC_LOW="${NTFY_TOPIC_LOW:-$NTFY_TOPIC_HIGH}"
 NTFY_TOKEN="${NTFY_TOKEN:-}"
 PING_URL="${RESTIC_PING_URL:-}"
 
@@ -135,6 +139,14 @@ run_step() {
 on_unexpected_error() {
   local rc=$?
   trap - ERR                     # never re-enter, even if notify_failure fails
+  # A command substitution FORKS, and under `set -E` the fork inherits this trap.
+  # Without this guard a failing $( ) -- $(hostname) in notify_failure, $(date)
+  # in log(), $(tail ...) below -- would run the whole alert path inside the
+  # subshell: a duplicate page, mis-staged as "script", and (when the $( ) is an
+  # argument) the handler's own log line captured into the alert title. Let only
+  # the real script report; the parent still fires this trap if the failed
+  # substitution actually failed its enclosing command.
+  [[ "$BASHPID" == "$$" ]] || exit "$rc"
   log "ERROR: unexpected failure (line ${BASH_LINENO[0]}, exit $rc)"
   notify_failure script "$rc" "see journal/log"
   exit "$rc"
@@ -172,7 +184,9 @@ db_dump_to() {
   set -e; arm_err_trap
   if (( rc != 0 )) || [[ ! -s "$tmp" ]]; then
     local why; if (( rc != 0 )); then why="exit $rc"; else why="empty output"; rc=1; fi
-    local msg; msg="$(tail -c 800 "$err" 2>/dev/null)"
+    # `|| true`: if $err is unreadable/gone, tail fails -- without this the ERR
+    # trap takes over and the alert loses this dump's stage name and exit code.
+    local msg; msg="$(tail -c 800 "$err" 2>/dev/null || true)"
     rm -f "$tmp" "$err"
     notify_failure "dump:$name" "$rc" "${msg:-$why}"
     exit "$rc"
