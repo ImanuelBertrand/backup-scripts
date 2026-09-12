@@ -575,35 +575,65 @@ restic dump latest /root/.config/restic/db-dumps/mariadb-all.sql | head -50
 ## 6. Maintenance host (retention, prune, check)
 
 Clients **cannot** delete anything — that's the point of `--append-only`. So
-retention runs on the backup host as *local* restic, directly against each
-subrepo, bypassing rest-server entirely.
+retention runs on the backup host, through a **second** rest-server: LAN-only,
+delete-capable, and behind its own htpasswd file, so a leaked client backup
+credential cannot authenticate against it.
 
-This is not shipped in this repo. A starting point, as a daily cron:
+`restic-maintenance.sh` in this repo is what runs there, daily from cron. Per
+client, in order:
 
-```bash
-#!/bin/bash
-set -euo pipefail
-for repo in /share/Backups/restic/data/*/; do
-  user=$(basename "$repo")
-  export RESTIC_REPOSITORY="$repo"
-  export RESTIC_PASSWORD_FILE="/root/.restic-pw/$user"
-  restic forget --keep-daily 14 --keep-weekly 8 --keep-monthly 12 --keep-yearly 3 --prune
-  restic check
-done
+```
+unlock → forget → prune → check → restore smoke-test
 ```
 
-Three things to be deliberate about:
+`check` and the restore test run every time. `forget` and `prune` run only when
+that client's last successful prune is older than `PRUNE_MIN_INTERVAL_DAYS`:
+prune is the expensive step — repacking touches every partially-used pack file
+— so each client carries its own timestamp under `$CONFIG_DIR/state/` and comes
+due independently, rather than every repo landing on the same night. `--prune`
+forces it for every client in one run.
 
-- **This host can decrypt everything.** It needs every client's encryption
-  password. Treat it as being as sensitive as all the clients combined; `0600`,
-  root-only, ideally on encrypted storage.
+`check` runs *after* prune deliberately: prune is the one step that rewrites
+pack files, so verifying behind it catches a bad repack in the run that caused
+it. The restore smoke-test then pulls one small known file out of `latest` and
+asserts it materialised — `check` validates structure, but only an actual
+restore proves that repo, password, decrypt and restore path still turn into
+real bytes.
+
+Config is hand-managed on that host, in
+`$HOME/.config/restic-maintenance/config`, with each client's repo encryption
+password beside it as `encryption_pw_<name>`. `deploy.sh` pushes to clients
+only and never touches any of it.
+
+Four things to be deliberate about:
+
+- **This host can decrypt everything.** It holds every client's encryption
+  password, which makes it as sensitive as all the clients combined; `0600`,
+  root-only, ideally on encrypted storage. The script refuses to start if its
+  config or the directory holding it is group- or world-writable — that file is
+  `source`d, so anything able to write it owns this host and every repo it
+  reaches.
 - **Prune takes the repo lock.** Clients wait `LOCK_WAIT` (default 15m) via
   `--retry-lock`, so schedule maintenance well away from the client window —
   with the default `BACKUP_WINDOW="23-06"`, and catch-up runs possible at any
   hour, late morning is the safe slot.
-- **`restic check` doesn't read the data** by default. Periodically run
-  `restic check --read-data-subset=5%` to catch bit-rot; a full `--read-data`
-  occasionally if the repo size allows.
+- **`restic check` doesn't read the data** by default. Set
+  `CHECK_READ_DATA_SUBSET` (e.g. `"5%"`) and the script rotates a deterministic
+  slice by day-of-year, covering the whole repo every 20 runs. restic's own `x%`
+  form re-samples at random each run and never guarantees coverage, which is why
+  the script converts the percentage into the `n/t` form itself.
+- **`--group-by host` is load-bearing**, and lives in the script rather than in
+  `FORGET_POLICY_DEFAULT` — a per-client override replaces the whole policy
+  string, so leaving it in config lets a future override drop it silently on one
+  client. restic's default is `host,paths`, which applies the keep-set
+  separately to every distinct path set — and path sets move: adding `/boot` to
+  a client's `BACKUP_PATHS` changes one, and so does a night where the dumps
+  produce nothing, since the client appends `$DUMP_DIR` only when that directory
+  has content. Each variant becomes its own group, and a group that stops
+  receiving snapshots never ages out, because `--keep-daily N` keeps the last N
+  days *that have snapshots*, not the last N days. The orphan is thinned once
+  and pinned forever, where prune cannot reclaim it. One repo per client makes
+  host grouping one group per repo, which is the intent everywhere here.
 
 Off-site: mirror `/share/Backups/restic/data` (it's encrypted at rest, so a dumb
 file copy is fine), or use `restic copy` to a second repo.
