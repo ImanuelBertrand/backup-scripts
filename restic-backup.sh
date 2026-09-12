@@ -38,7 +38,7 @@ set -euo pipefail
 # MAX_BACKUP_AGE_HOURS=36 is the hard fail. Every path that declines to back up
 # (not due, metered, tunnel down) exits through stale_exit(), so a host that
 # quietly stops backing up alerts LOCALLY instead of relying on the external
-# dead-man's switch. This is what makes a skip safe: it can no longer hide.
+# dead-man's switch. This is what makes a skip safe: a skip cannot hide.
 # Losing the lock is the one skip judged on a different number -- how long the
 # HOLDER has held it, because .last-success describes a run that has already
 # finished, not the one still going (see the lock section). Same threshold.
@@ -232,13 +232,13 @@ CONFIG_DIR="${RESTIC_CONFIG_DIR:-$HOME/.config/restic}"
 # ============================================================================
 #  NOTIFICATION BOOTSTRAP  --  built BEFORE the config is loaded, on purpose.
 #
-#  Everything that can go wrong while loading the config used to be completely
-#  silent: the ntfy and DMS settings live IN that config, so a file that would
-#  not parse -- a half-finished hand-edit, an interrupted deploy -- died with a
-#  bash error into `logger`, and MAILTO="" in the cron file ended it there. No
+#  Everything that can go wrong while loading the config is otherwise completely
+#  silent: the ntfy and DMS settings live IN that config, so a file that will
+#  not parse -- a half-finished hand-edit, an interrupted deploy -- dies with a
+#  bash error into `logger`, and MAILTO="" in the cron file ends it there. No
 #  push, no /fail ping, and not even the local staleness alarm, which is further
-#  down still. The host stopped backing up and nothing anywhere said a word;
-#  only the external dead-man's switch noticed, a grace period later.
+#  down still. The host stops backing up and nothing anywhere says a word;
+#  only the external dead-man's switch notices, a grace period later.
 #
 #  So the senders, the throttle and its state files are set up here, seeded from
 #  a pre-parse that reads the config as TEXT and never executes it, and an ERR
@@ -633,11 +633,11 @@ $(printf '%s' "$output" | tail -c 1500)"
 }
 
 # Runs one stage, streaming its output to the log AS IT HAPPENS while keeping a
-# copy for the failure notification. It used to capture into a variable and
-# print the lot afterwards, which meant the one case the lock-staleness alarm
+# copy for the failure notification. Streamed rather than captured into a
+# variable and printed afterwards, because the one case the lock-staleness alarm
 # exists for -- a `restic backup` wedged on a half-open WireGuard connection --
-# logged the ">>> backup" line and then nothing at all for a day and a half.
-# Kill that run and the buffer went with it, leaving nothing to diagnose from.
+# would then log the ">>> backup" line and nothing at all for a day and a half,
+# and killing that run takes the buffer with it, leaving nothing to diagnose.
 #
 # 9>&- keeps the lock fd out of the child. Anything a pre-backup hook leaves
 # running in the background would otherwise inherit the flock and hold it for
@@ -692,7 +692,7 @@ trap 'rc=$?; log "ERROR: unexpected failure (line $LINENO, exit $rc)"; notify_fa
 _slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
 
 # Run a command, send STDOUT to $DUMP_DIR/<name>.sql atomically. On failure (or
-# empty output) notify and abort the whole backup -- same policy as before:
+# empty output) notify and abort the whole backup -- the policy throughout here:
 # better no backup than a backup with a half-dumped database.
 db_dump_to() {
   local name; name="$(_slug "$1")"; shift
@@ -928,8 +928,8 @@ from BACKUP_PATHS."
 # urgently when the set appears, again whenever it changes, then every
 # NOTIFY_REPEAT_HOURS. It is the loudest condition here, so this is a visibility
 # gap, not an alerting one. Making it red would also leave deploy.sh --check red
-# until someone hand-edited the config on that host, which is the same wedged
-# gate that made the old fatal preflight worth removing.
+# until someone hand-edited the config on that host -- a gate wedged open on
+# manual intervention, which is what this condition must not become.
 #
 # Reads what the last due run recorded rather than re-scanning /proc/self/mounts:
 # --status must stay cheap and side-effect-free, and the age says how fresh the
@@ -1027,26 +1027,27 @@ check_one_file_system_coverage() {
   if (( ! ${#gap_targets[@]} )); then
     # Records the CLEAN SCAN rather than removing the file. "No file" and
     # "looked, found nothing" are different claims, and with the file gone
-    # --status could not tell them apart: it read a freshly deployed host as
-    # "all mounts covered" before any due run had scanned it, which
+    # --status cannot tell them apart: it reads a freshly deployed host as
+    # "all mounts covered" before any due run has scanned it, which
     # FORCE_AFTER_HOURS can put a day away. Reporting healthy without having
-    # looked is the thing this series keeps taking out.
+    # looked is the one claim this must never make.
     #
-    # An empty set still makes a recurrence page at once, which is what the rm
-    # was for: mount_gap_should_push compares SETS, and any gap differs from
+    # An empty set still makes a recurrence page at once -- deleting the file
+    # would give that too, and this keeps it: mount_gap_should_push compares
+    # SETS, and any gap differs from
     # none, so the repeat interval is not inherited from the last occurrence.
     (( REPORT_ONLY )) || write_state "$MOUNT_GAP_FILE" "$NOW" ""
     return 0
   fi
 
-  # This ALERTS, it no longer aborts. It used to call preflight_fail, which
-  # exits -- so a transient mount inside the backup set that is not under /mnt,
-  # /media or /run (a one-off NFS share at /srv/incoming, a loop-mounted image,
-  # a btrfs subvolume an update created) turned every subsequent hourly run into
-  # no backup AT ALL, with no operator override: --force does not reach past
-  # here either. The state that was being defended against -- a snapshot missing
-  # one mount -- is strictly better than the state that produced: no snapshot,
-  # of anything, until someone hand-edits the config on that host.
+  # This ALERTS; it deliberately does not abort. Calling preflight_fail here,
+  # which exits, would turn a transient mount inside the backup set that is not
+  # under /mnt, /media or /run (a one-off NFS share at /srv/incoming, a
+  # loop-mounted image, a btrfs subvolume an update created) into no backup AT
+  # ALL on every subsequent hourly run, with no operator override: --force does
+  # not reach past here either. The state being defended against -- a snapshot
+  # missing one mount -- is strictly better than the state that would produce:
+  # no snapshot, of anything, until someone hand-edits the config on that host.
   #
   # So: back up what we can, and make the gap as loud as the abort was. Urgent
   # priority, the same throttle policy, and stderr as well as the log, because
@@ -1112,7 +1113,7 @@ FIRST_SEEN=$(read_epoch "$FIRST_SEEN_FILE")
 # indefinitely. Precisely on the host where cron never fires at all (crond
 # stopped, or the /etc/cron.d file rejected -- the failure the dot-in-filename
 # guard and the restic-backup.cron header exist for), which is the one state
-# the exit-3 gate was added to catch and the one it could not see.
+# the exit-3 gate exists to catch -- and, without this write, cannot see.
 if [[ ! -s "$FIRST_SEEN_FILE" ]]; then write_state "$FIRST_SEEN_FILE" "$FIRST_SEEN"; fi
 
 if (( LAST_SUCCESS > 0 )); then
@@ -1154,13 +1155,13 @@ in_backup_window() {
 # MAX_BACKUP_AGE_HOURS; they differ only in which age they compare against.
 # Exits 1 when stale (a real failure), else 0.
 # $2 is the age to judge, defaulting to the age of the last success. The lock
-# path passes the holder's age instead, and used to only be able to ask for the
-# check while this function silently made it against ALERT_AGE_SEC anyway. That
-# happens to give the same answer today -- a holder cannot have written
-# .last-success yet, so the last success is always at least as old as the lock --
-# but it contradicted the comments either side of it, and any future change to
-# .first-seen handling, or forward clock skew, would have turned the documented
-# "page when the holder is wedged" into a silent exit 0.
+# path passes the holder's age instead, and it is threaded through as an
+# argument rather than re-derived here: judging against ALERT_AGE_SEC gives the
+# same answer today -- a holder cannot have written .last-success yet, so the
+# last success is always at least as old as the lock -- but it would contradict
+# the comments either side of this, and any change to .first-seen handling, or
+# forward clock skew, would turn the documented "page when the holder is wedged"
+# into a silent exit 0.
 stale_exit() {
   local reason="$1" age="${2:-$ALERT_AGE_SEC}"
   if (( MAX_AGE_SEC > 0 && age >= MAX_AGE_SEC )); then
@@ -1234,12 +1235,12 @@ lock_held_secs() {                     # seconds since the holder took the lock
   (( d > 0 )) || d=0                   # clock skew
   printf '%s' "$d"
 }
-# No flock, no run. This used to be an `if`, with no else: a host without
-# util-linux got no locking at all and nothing said so. An hourly backup that
-# overruns the hour then meets the next invocation head-on, and the newcomer's
-# cleanup_dumps() wipes $DUMP_DIR out from under the run in progress -- which
-# finishes and reports success, minus every database dump. A missing lock is not
-# a safe degradation of a backup script.
+# No flock, no run -- fatal, rather than running unlocked, because a host
+# without util-linux would otherwise get no locking at all with nothing saying
+# so. An hourly backup that overruns the hour then meets the next invocation
+# head-on, and the newcomer's cleanup_dumps() wipes $DUMP_DIR out from under the
+# run in progress -- which finishes and reports success, minus every database
+# dump. A missing lock is not a safe degradation of a backup script.
 command -v flock >/dev/null 2>&1 || preflight_fail \
 "flock is missing (install util-linux), so this run cannot take the
 single-instance lock. Two overlapping runs would wipe each other's database

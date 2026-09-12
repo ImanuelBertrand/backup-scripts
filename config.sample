@@ -121,10 +121,10 @@ MIN_INTERVAL_HOURS="20"
 FORCE_AFTER_HOURS="24"
 
 # ---- Staleness = the hard fail ----------------------------------------------
-# THIS replaces the old SKIP_IF_UNREACHABLE boolean. Skipping is always silent;
-# what turns silence into an alert is age. Every path that declines to back up
-# (not due, metered, tunnel down) checks this first, so a host that quietly
-# stops backing up pages you locally instead of waiting on the external
+# Skipping is always silent; what turns silence into an alert is age. Every
+# path that declines to back up (not due, metered, tunnel down) checks this
+# first, so a host that quietly stops backing up pages you locally instead of
+# waiting on the external
 # dead-man's switch. Losing the lock to a still-running backup is checked
 # against how long THAT run has been going instead -- the last success says
 # nothing about a run that has not finished -- but against this same limit.
@@ -184,7 +184,7 @@ WG_INTERFACE=""                                    # e.g. "wg0"
 # backend that is genuinely down for two days would be met with 48 tunnel
 # restarts. The FIRST bounce of an outage is always immediate -- this only
 # spaces the retries -- and a successful backup resets it.
-#   0 = no limit (bounce on every due run, the old behaviour)
+#   0 = no limit (bounce on every due run)
 # WG_BOUNCE_INTERVAL_HOURS="6"
 
 # ---- Failure notifications (ntfy) -- failure-only; success is silent --------

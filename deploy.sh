@@ -168,10 +168,10 @@ rq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 #
 # NOT `awk '$2==p'`: sha256sum separates the hash from the name with TWO spaces
 # and does not escape a space INSIDE the name, so for /opt/a b/f.sh the second
-# field is "/opt/a" and the match never fires. The hash then came back empty,
-# compared unequal to the local one, and the host was reported as needing that
-# file on every single run and re-pushed forever. rq() was added so these paths
-# survive the ssh boundary; this is the other half of that.
+# field is "/opt/a" and the match never fires. The hash then comes back empty,
+# compares unequal to the local one, and the host is reported as needing that
+# file on every single run and re-pushed forever. rq() quotes these paths across
+# the ssh boundary; this is the other half of that.
 #
 # Match on the fixed-width hash and on the exact remainder of the line instead.
 # A name containing a backslash makes sha256sum escape the line and prefix it
@@ -233,11 +233,11 @@ if (( CHECK_ONLY )); then
   rc=0
   for h in "${HOSTS[@]}"; do
     printf '\n=== %s ===\n' "$h"
-    # The prerequisite probe used to live only in the plan pass, which --check
-    # returns before ever reaching -- so the mode documented as the CI gate
-    # never once reported a missing restic or flock. A host with restic
-    # uninstalled passed cleanly (--status does not call check_restic_present
-    # either) right up until MAX_BACKUP_AGE_HOURS elapsed, hours later.
+    # The prerequisite probe belongs HERE, not only in the plan pass, which
+    # --check returns before ever reaching -- otherwise the mode documented as
+    # the CI gate reports neither a missing restic nor a missing flock, and a
+    # host with restic uninstalled passes cleanly (--status does not call
+    # check_restic_present either) until MAX_BACKUP_AGE_HOURS elapses.
     #
     # Same round trip, and --status runs LAST so $? is still its own exit code.
     S="$(sudo_for "$(addr_of "$h")")"
@@ -246,9 +246,9 @@ if (( CHECK_ONLY )); then
     prereq="$(prereq_list "$out")"
     [[ -n "$prereq" ]] && PREREQ[$h]="$prereq"
     sed '/^#PRE /d' <<<"$out"
-    # 3 is --status's "past MAX_BACKUP_AGE_HOURS". It used to print
-    # "stale : YES -- would alert" and exit 0, so a host that had quietly
-    # stopped backing up sailed through this gate.
+    # 3 is --status's "past MAX_BACKUP_AGE_HOURS", and has to reach the exit
+    # code here: a host printing "stale : YES -- would alert" while exiting 0
+    # would sail through this gate having quietly stopped backing up.
     case "$s" in
       0) ;;
       3) echo "  STALE: no successful backup within MAX_BACKUP_AGE_HOURS"; rc=1 ;;
@@ -523,9 +523,9 @@ fi
 # place makes a live run execute whatever lands at that offset. rename(2) hands
 # the running process its old inode and is atomic.
 # The staging file lives in the DESTINATION directory, which is root-owned, and
-# the content arrives on ssh's stdin rather than through scp. It used to be
-# staged at /tmp/.deploy-$$-$RANDOM, which is a guessable name in a directory
-# every local user can write: $$ is fixed for a whole deploy run and visible in
+# the content arrives on ssh's stdin rather than through scp. Staging in /tmp
+# under a name a local user can predict -- .deploy-$$-$RANDOM and anything like
+# it -- is what this avoids: $$ is fixed for a whole deploy run and visible in
 # the name of the first staged file, $RANDOM is 15 bits, and scp opens its
 # destination O_CREAT|O_TRUNC as root with no O_EXCL and no O_NOFOLLOW. Any
 # unprivileged user on a target could pre-create the 32768 candidate symlinks,
@@ -560,10 +560,10 @@ for h in "${HOSTS[@]}"; do
   addr="$(addr_of "$h")"; CURRENT_HOST="$h"
   printf '\n=== %s ===\n' "$h"
   ok=1
-  # Ordered, and each step gated on the one before it. The three pushes used to
-  # run unconditionally, recording ok=0 without acting on it, so a script push
-  # that failed -- a full disk, a read-only /usr, a connection dropped mid-run --
-  # was still followed by the cron entry. That leaves an hourly root job pointing
+  # Ordered, and each step gated on the one before it. Running the three pushes
+  # unconditionally -- recording ok=0 without acting on it -- lets a script push
+  # that failed (a full disk, a read-only /usr, a connection dropped mid-run) be
+  # followed by the cron entry anyway. That leaves an hourly root job pointing
   # at a script that is not there: the host backs up nothing, and since the
   # staleness alerting only ever runs FROM that job, neither the host nor this
   # tool ever says so. It is the same silent-no-backup state the NO_CRON warning
