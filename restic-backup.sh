@@ -542,7 +542,11 @@ notify_failure() {
     if (( REPORT_ONLY )); then
       log "NOTICE: '$stage' failed (exit $code); diagnostic mode -- no alert sent"
     else
-      log "NOTICE: '$stage' failed (exit $code); notification suppressed (already alerted, age $(fmt_age "$ALERT_AGE_SEC"))"
+      # $age, not $ALERT_AGE_SEC: the hard/soft decision just above was made on
+      # $age, and on the lock path they are different numbers -- stale_exit
+      # passes the HOLDER's age there, precisely because .last-success
+      # describes a run that already finished, not the one still going.
+      log "NOTICE: '$stage' failed (exit $code); notification suppressed (already alerted, age $(fmt_age "$age"))"
     fi
     return 0
   fi
