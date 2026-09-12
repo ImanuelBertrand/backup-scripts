@@ -88,7 +88,9 @@ warn_no_cron() {
 
 # Same class of problem as a missing CRON_MINUTE: the deploy succeeds, --status
 # looks like a fresh install, and the host never backs up. Reported, not
-# enforced -- a first deploy legitimately lands before the hand-managed config.
+# enforced during a deploy -- a first deploy legitimately lands before the
+# hand-managed config. --check is not a deploy, so there it is a failure.
+declare -A PREREQ=()
 warn_prereqs() {
   (( ${#PREREQ[@]} )) || return 0
   printf '\nWARNING: missing prerequisites on:\n' >&2
@@ -159,6 +161,19 @@ remote_sha() {                         # remote_sha <sha256sum-output> <path>
   ' <<<"$1"
 }
 
+# The shell fragment that reports what a host is missing, emitted as '#PRE '
+# lines. Shared by --check and the plan pass so the two modes cannot disagree
+# about what a healthy host needs -- none of these can be seen from here, and
+# every one of them is a host that installs cleanly and then never backs up.
+prereq_probe() {
+  cat <<EOF
+command -v restic >/dev/null 2>&1 || echo '#PRE restic is not installed'
+command -v flock  >/dev/null 2>&1 || echo '#PRE flock is missing (util-linux)'
+[ -f $(rq "$CONFIG_DIR/config") ]        || echo '#PRE no config'
+[ -r $(rq "$CONFIG_DIR/encryption-pw") ] || echo '#PRE no encryption-pw'
+EOF
+}
+
 # Rewrite the shipped cron template for ONE host: its own minute, and whatever
 # paths deploy.conf uses.
 render_cron() {
@@ -174,9 +189,18 @@ if (( CHECK_ONLY )); then
   rc=0
   for h in "${HOSTS[@]}"; do
     printf '\n=== %s ===\n' "$h"
-    out=$(ssh -n "${SSH_OPTS[@]}" "$(addr_of "$h")" \
-         "RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" 2>&1) && s=0 || s=$?
-    printf '%s\n' "$out"
+    # The prerequisite probe used to live only in the plan pass, which --check
+    # returns before ever reaching -- so the mode documented as the CI gate
+    # never once reported a missing restic or flock. A host with restic
+    # uninstalled passed cleanly (--status does not call check_restic_present
+    # either) right up until MAX_BACKUP_AGE_HOURS elapsed, hours later.
+    #
+    # Same round trip, and --status runs LAST so $? is still its own exit code.
+    out=$(ssh -n "${SSH_OPTS[@]}" "$(addr_of "$h")" "$(prereq_probe)
+         RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" 2>&1) && s=0 || s=$?
+    prereq="$(sed -n 's/^#PRE //p' <<<"$out" | paste -sd, - | sed 's/,/, /g')"
+    [[ -n "$prereq" ]] && PREREQ[$h]="$prereq"
+    sed '/^#PRE /d' <<<"$out"
     # 3 is --status's "past MAX_BACKUP_AGE_HOURS". It used to print
     # "stale : YES -- would alert" and exit 0, so a host that had quietly
     # stopped backing up sailed through this gate.
@@ -187,9 +211,12 @@ if (( CHECK_ONLY )); then
     esac
   done
   warn_no_cron
-  # A fleet with unscheduled hosts is not healthy, so --check must not exit 0 on
-  # it -- that is the whole point of a mode meant to be run from CI.
-  (( ${#NO_CRON[@]} )) && rc=1
+  warn_prereqs
+  # A fleet with unscheduled hosts, or hosts that cannot run a backup at all, is
+  # not healthy, so --check must not exit 0 on it -- that is the whole point of a
+  # mode meant to be run from CI. (During a deploy these stay warnings: a first
+  # deploy legitimately lands before the hand-managed config.)
+  (( ${#NO_CRON[@]} || ${#PREREQ[@]} )) && rc=1
   exit "$rc"
 fi
 
@@ -203,7 +230,7 @@ fi
 # ---- pass 1: plan ----
 local_sh="$(sha_of "$SRC_DIR/restic-backup.sh")"
 local_ex="$(sha_of "$SRC_DIR/excludes")"
-declare -A PLAN=() CRONTMP=() PREREQ=()
+declare -A PLAN=() CRONTMP=()
 pending=0; unreachable=(); CURRENT_HOST=""
 # The four hand-written cleanup loops this replaces all missed the "Not a
 # terminal; re-run with --yes" exit, and any abort from set -e or Ctrl-C.
@@ -225,10 +252,7 @@ for h in "${HOSTS[@]}"; do
   # which is the failure this tool is least able to notice afterwards.
   remote="$(ssh -n "${SSH_OPTS[@]}" "$addr" "
       sha256sum $(rq "$SBIN_PATH") $(rq "$CONFIG_DIR/excludes") $(rq "$CRON_PATH") 2>/dev/null
-      command -v restic >/dev/null 2>&1 || echo '#PRE restic is not installed'
-      command -v flock  >/dev/null 2>&1 || echo '#PRE flock is missing (util-linux)'
-      [ -f $(rq "$CONFIG_DIR/config") ]        || echo '#PRE no config'
-      [ -r $(rq "$CONFIG_DIR/encryption-pw") ] || echo '#PRE no encryption-pw'
+$(prereq_probe)
       true" 2>/dev/null)" || {
     unreachable+=("$h"); PLAN[$h]="unreachable"; continue; }
   prereq="$(sed -n 's/^#PRE //p' <<<"$remote" | paste -sd, - | sed 's/,/, /g')"
