@@ -1182,13 +1182,20 @@ if _have_db_config || [[ -x "$PRE_BACKUP_HOOK" ]]; then
   trap 'log "Interrupted (SIGINT); wiping $DUMP_DIR.";  cleanup_dumps; exit 130' INT
   trap 'log "Interrupted (SIGHUP); wiping $DUMP_DIR.";  cleanup_dumps; exit 129' HUP
   cleanup_dumps                       # clear any junk a crashed run left
+  # 077 covers the hook as well as the native dumps. The hook writes plaintext
+  # into the same directory and is equally hand-written; restoring the
+  # inherited umask first (022 under cron) meant a hook that does not set its
+  # own -- the shipped ./pre-backup does, a copied-and-edited one may not --
+  # produced world-readable dumps. DUMP_DIR being 0700 contains it either way,
+  # but there is no reason to widen the mask for the one stage most likely to
+  # get this wrong.
   __um=$(umask); umask 077            # dumps are 0600
   run_db_dumps
-  umask "$__um"
   [[ -x "$PRE_BACKUP_HOOK" ]] && {
     require_trusted "$PRE_BACKUP_HOOK" "the pre-backup hook"
     export DUMP_DIR; run_step "pre-backup-hook" "$PRE_BACKUP_HOOK"
   }
+  umask "$__um"
   # Any artifact counts, not just *.sql -- the hook is generic and may write
   # anything, dot-prefixed included, which is why this is find and not a glob.
   # (A failing test here is exempt from set -e: it precedes the &&.)
