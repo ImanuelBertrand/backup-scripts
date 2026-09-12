@@ -159,7 +159,7 @@ LOCK_WAIT="${LOCK_WAIT:-15m}"
 SKIP_IF_METERED="${SKIP_IF_METERED:-false}"
 
 # Scheduling / staleness. Hours; 0 disables that particular rule.
-BACKUP_WINDOW="${BACKUP_WINDOW:-23-06}"              # "" = no window
+BACKUP_WINDOW="${BACKUP_WINDOW-23-06}"               # unset = 23-06, "" = no window
 int_cfg MIN_INTERVAL_HOURS   20
 int_cfg FORCE_AFTER_HOURS    24
 int_cfg MAX_BACKUP_AGE_HOURS 36                      # 0 = never hard-fail on age
