@@ -857,14 +857,6 @@ from BACKUP_PATHS."
   done
 }
 
-# Throttle for the coverage alert below. It cannot use $NOTIFY_STATE_FILE: that
-# one is removed on every success, and these runs DO succeed -- the gap does not
-# stop the backup -- so it would page on all 24 invocations a day. Keyed on the
-# SET of gaps instead, so a new mount appearing is its own event rather than
-# being swallowed by the repeat interval. State: "<epoch> <key>".
-#
-# Pages when the set first appears, whenever it changes, and then at most every
-# NOTIFY_REPEAT_HOURS (0 = never again), matching notify_should_push's policy.
 # What --status says about coverage. A host with a live gap is producing
 # INCOMPLETE backups while .last-success updates normally, so "stale : no" and
 # exit 0 are both true and both beside the point -- without this line the fleet
@@ -897,6 +889,14 @@ mount_gap_status() {
   fi
 }
 
+# Throttle for the coverage alert below. It cannot use $NOTIFY_STATE_FILE: that
+# one is removed on every success, and these runs DO succeed -- the gap does not
+# stop the backup -- so it would page on all 24 invocations a day. Keyed on the
+# SET of gaps instead, so a new mount appearing is its own event rather than
+# being swallowed by the repeat interval. State: "<epoch> <key>".
+#
+# Pages when the set first appears, whenever it changes, and then at most every
+# NOTIFY_REPEAT_HOURS (0 = never again), matching notify_should_push's policy.
 mount_gap_should_push() {              # mount_gap_should_push KEY
   (( REPORT_ONLY )) && return 1
   local key="$1" last=0 seen=""
