@@ -284,9 +284,14 @@ if (( DRY_RUN )); then
   (( ${#unreachable[@]} )) && exit 1; exit 0
 fi
 
+# The diff is not part of the prompt -- it is the record of what root-executed
+# code this run changed on every host, and the whole case for pushing rather
+# than letting clients pull rests on it being shown. --yes suppresses the
+# QUESTION, not the record: it is aimed at cron and CI, which is exactly where
+# nobody is watching and the log is all there will be afterwards.
+(( ASSUME_YES )) || [[ -t 0 ]] || { echo "Not a terminal; re-run with --yes." >&2; exit 1; }
+show_diffs
 if (( ! ASSUME_YES )); then
-  [[ -t 0 ]] || { echo "Not a terminal; re-run with --yes." >&2; exit 1; }
-  show_diffs
   read -r -p $'\nPush to the hosts listed above? [y/N] ' ans
   [[ "$ans" == [yY]* ]] || { echo "Aborted."; exit 1; }
 fi
