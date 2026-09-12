@@ -39,6 +39,11 @@
 /swapfile
 /swap.img
 
+# ---- Crash dumps (kernel vmcore, apport, systemd-coredump) ----
+# Gigabytes on a host that has crashed, and worth nothing at restore time.
+/var/crash
+/var/lib/systemd/coredump
+
 # ---- This client's own restic secrets: excluded by the script ----
 # encryption-pw and config are excluded by restic-backup.sh, which builds both
 # paths from $CONFIG_DIR and passes them to restic directly.
@@ -58,6 +63,20 @@
 # ---- General caches & trash ----
 .cache
 .local/share/Trash
+
+# ---- Package-manager caches (re-downloaded on demand) ----
+# apt's index lists matter beyond their size: "apt update" rewrites them whole,
+# so they are new content in EVERY snapshot rather than bulk paid for once.
+#
+# The subdirectories are named rather than /var/cache as a whole, because that
+# tree also holds /var/cache/debconf, whose config.dat and passwords.dat are real
+# state -- including credentials packages set at install time.
+/var/cache/apt/archives
+/var/lib/apt/lists
+/var/cache/dnf
+/var/cache/libdnf5
+/var/cache/PackageKit
+/var/lib/snapd/snaps
 
 # ---- Node / JS ----
 node_modules
@@ -91,6 +110,12 @@ __pycache__
 # excludes.local, or the next deploy undoes it.
 .venv
 venv
+# uv-managed CPython builds ("uv python install"), re-downloadable and ~100 MB
+# each. uv's own cache is ~/.cache/uv, already covered by .cache above.
+.local/share/uv/python
+# pipenv's virtualenv store: same class as the venvs, recreatable from
+# Pipfile.lock, taken back the same way ("!.local/share/virtualenvs").
+.local/share/virtualenvs
 
 # ---- PHP / Composer ----
 # Composer's cache when COMPOSER_HOME=~/.composer (the XDG default is under .cache).
@@ -100,6 +125,21 @@ venv
 # restore with no "composer install" (network + correct PHP version) on the DR
 # path. Take it back with "!vendor" in that host's excludes.local.
 vendor
+
+# ---- PHP runtime scratch (Debian and RHEL layouts) ----
+# Session files are thousands of tiny files rewritten on every request. Keeping
+# them costs churn in every snapshot and buys a restore where users are still
+# logged in to a machine that just came back from the dead.
+/var/lib/php/sessions
+/var/lib/php/session
+/var/lib/php/opcache
+/var/lib/php/wsdlcache
+
+# ---- Apache disk cache (mod_cache_disk; Debian and RHEL layouts) ----
+# Cached upstream responses, refilled by traffic. The config under /etc/apache2
+# or /etc/httpd and the sites under /var/www stay in the backup.
+/var/cache/apache2
+/var/cache/httpd
 
 # ---- .NET / NuGet ----
 # Global package cache (~/.nuget/packages); regenerable via "dotnet restore".
@@ -128,3 +168,10 @@ vendor
 # specific DB volume paths if you want to avoid that redundant copy. That is a
 # per-host decision, so it belongs in excludes.local, e.g.:
 # /var/lib/docker/volumes/myapp_db
+
+# ---- containerd (the runtime under Docker; data-root /var/lib/containerd) ----
+# Content store + snapshotter layers: the same image data as overlay2 above, in
+# containerd's own format, re-pulled on first start. Nothing persistent lives
+# here -- named volumes belong to Docker, under /var/lib/docker/volumes, which
+# the block above keeps on purpose.
+/var/lib/containerd
