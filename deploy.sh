@@ -39,6 +39,8 @@ set -euo pipefail
 #                               stdin is not a terminal (cron, CI)
 #   ./deploy.sh --force         push even where the checksums already match,
 #                               to undo a hand-edit made on a target
+#   ALLOW_STALE=1 ./deploy.sh   push even though this checkout is behind its
+#                               git remote (normally a refusal)
 # ============================================================================
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -265,10 +267,66 @@ fi
 
 # ---- local preflight: never ship a script that does not parse ----
 bash -n "$SRC_DIR/restic-backup.sh" || { echo "FATAL: local restic-backup.sh has syntax errors" >&2; exit 1; }
-if git -C "$SRC_DIR" rev-parse --git-dir >/dev/null 2>&1 \
-   && ! git -C "$SRC_DIR" diff --quiet HEAD -- restic-backup.sh excludes restic-backup.cron 2>/dev/null; then
-  echo "NOTE: deploying uncommitted local changes."
-fi
+
+# A checkout that is BEHIND its remote is the one local mistake nothing
+# downstream calls a mistake. The plan compares checksums, so an older local
+# file is an ordinary "push this" action, each host records a routine update,
+# and the fleet rolls backwards. The diff pass shows a human the change
+# inverted -- which is no guard at all under --yes.
+#
+# Only a fetch can answer the question. The remote-tracking ref on its own is
+# as old as the last fetch, and the machine that has been editing all day is
+# precisely the one whose refs are stale.
+git_preflight() {
+  local up remote behind
+  git -C "$SRC_DIR" rev-parse --git-dir >/dev/null 2>&1 || return 0
+
+  git -C "$SRC_DIR" diff --quiet HEAD -- restic-backup.sh excludes restic-backup.cron 2>/dev/null \
+    || echo "NOTE: deploying uncommitted local changes."
+
+  up="$(git -C "$SRC_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" || return 0
+  [[ -n "$up" ]] || return 0                         # no upstream: behaves as it always did
+  remote="${up%%/*}"
+
+  # Offline is not a reason to refuse. The fleet is reached over WireGuard, and
+  # whether the git remote answers says nothing about whether the hosts do.
+  if ! git -C "$SRC_DIR" fetch --quiet "$remote" 2>/dev/null; then
+    echo "NOTE: cannot reach $remote; deploying without checking for newer commits."
+    return 0
+  fi
+
+  behind="$(git -C "$SRC_DIR" rev-list --count "HEAD..$up" 2>/dev/null)" || return 0
+  (( behind )) || return 0
+
+  # --dry-run pushes nothing, so it gets the warning and still plans: refusing
+  # to show someone what a deploy WOULD do is the wrong answer to "you are out
+  # of date".
+  if (( DRY_RUN )); then
+    echo "WARNING: this checkout is $behind commit(s) behind $up. Planning anyway (--dry-run)."
+    return 0
+  fi
+  if (( ${ALLOW_STALE:-0} )); then
+    echo "WARNING: this checkout is $behind commit(s) behind $up, and ALLOW_STALE=1"
+    echo "  is set. Every host is being reverted to this older state."
+    return 0
+  fi
+
+  cat >&2 <<EOF
+FATAL: this checkout is $behind commit(s) behind $up.
+
+Deploying now pushes the OLDER files to every host, and nothing downstream
+reports it: the plan sees a checksum difference and each host records an
+ordinary update.
+
+    git -C $SRC_DIR pull --rebase
+
+If reverting the fleet to this state is the actual intent, say so:
+
+    ALLOW_STALE=1 $0
+EOF
+  return 1
+}
+git_preflight || exit 1
 
 # ---- pass 1: plan ----
 local_sh="$(sha_of "$SRC_DIR/restic-backup.sh")"
