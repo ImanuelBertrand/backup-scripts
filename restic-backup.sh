@@ -869,19 +869,28 @@ lock_held_secs() {                     # seconds since the holder took the lock
   (( d > 0 )) || d=0                   # clock skew
   printf '%s' "$d"
 }
-if command -v flock >/dev/null 2>&1; then
-  exec 9>>"$LOCK_FILE"                 # append, NOT truncate: opening it must not
+# No flock, no run. This used to be an `if`, with no else: a host without
+# util-linux got no locking at all and nothing said so. An hourly backup that
+# overruns the hour then meets the next invocation head-on, and the newcomer's
+# cleanup_dumps() wipes $DUMP_DIR out from under the run in progress -- which
+# finishes and reports success, minus every database dump. A missing lock is not
+# a safe degradation of a backup script.
+command -v flock >/dev/null 2>&1 || preflight_fail \
+"flock is missing (install util-linux), so this run cannot take the
+single-instance lock. Two overlapping runs would wipe each other's database
+dumps mid-backup, and the survivor would still report success."
+
+exec 9>>"$LOCK_FILE"                   # append, NOT truncate: opening it must not
                                        # reset the mtime we are about to read
-  if flock -n 9; then
-    touch "$LOCK_FILE" 2>/dev/null || true    # mtime = when THIS run took the lock
-  else
-    held="$(lock_held_secs)"
-    log "Another run has held the lock for $(fmt_age "$held"); exiting."
-    if (( MAX_AGE_SEC > 0 && held >= MAX_AGE_SEC )); then
-      stale_exit "another run has been stuck for $(fmt_age "$held")"
-    fi
-    exit 0
+if flock -n 9; then
+  touch "$LOCK_FILE" 2>/dev/null || true      # mtime = when THIS run took the lock
+else
+  held="$(lock_held_secs)"
+  log "Another run has held the lock for $(fmt_age "$held"); exiting."
+  if (( MAX_AGE_SEC > 0 && held >= MAX_AGE_SEC )); then
+    stale_exit "another run has been stuck for $(fmt_age "$held")"
   fi
+  exit 0
 fi
 
 if [[ ! -s "$FIRST_SEEN_FILE" ]]; then write_state "$FIRST_SEEN_FILE" "$FIRST_SEEN"; fi
