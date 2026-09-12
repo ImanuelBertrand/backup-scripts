@@ -909,6 +909,21 @@ LAST_SUCCESS=$(read_epoch "$LAST_SUCCESS_FILE")
 FIRST_SEEN=$(read_epoch "$FIRST_SEEN_FILE")
 (( FIRST_SEEN > 0 )) || FIRST_SEEN=$NOW
 
+# Seeded HERE, before the diagnostic modes return -- not after the flock, which
+# only a real cron run ever reaches.
+#
+# It is the one state write --status is allowed to make, and the REPORT_ONLY
+# rule above is about not CONSUMING anything: the notification one-shot, the
+# DMS ping, the version-drift notice. This starts a clock, it does not spend
+# one, and without it --status on a host that has never backed up recomputes
+# FIRST_SEEN=$NOW on every single call. ALERT_AGE_SEC is then 0 forever and the
+# host reports "stale : no", exit 0 -- so deploy.sh --check passes it green
+# indefinitely. Precisely on the host where cron never fires at all (crond
+# stopped, or the /etc/cron.d file rejected -- the failure the dot-in-filename
+# guard and the restic-backup.cron header exist for), which is the one state
+# the exit-3 gate was added to catch and the one it could not see.
+if [[ ! -s "$FIRST_SEEN_FILE" ]]; then write_state "$FIRST_SEEN_FILE" "$FIRST_SEEN"; fi
+
 if (( LAST_SUCCESS > 0 )); then
   SCHED_AGE_SEC=$(( NOW - LAST_SUCCESS ))
   if (( SCHED_AGE_SEC < 0 )); then
@@ -1050,8 +1065,6 @@ else
   fi
   exit 0
 fi
-
-if [[ ! -s "$FIRST_SEEN_FILE" ]]; then write_state "$FIRST_SEEN_FILE" "$FIRST_SEEN"; fi
 
 if [[ -z "$DUE_REASON" ]]; then
   log "Not due (last success $(fmt_age "$SCHED_AGE_SEC") ago, window ${BACKUP_WINDOW:-any}); exiting."
