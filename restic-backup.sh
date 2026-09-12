@@ -92,6 +92,20 @@ while (( $# )); do
   shift
 done
 
+# --status and --check-update are diagnostic: they must change nothing anyone
+# else can observe. Every config guard below reaches preflight_fail, which is an
+# ALERTING path -- it pings the dead-man's switch, pushes an urgent ntfy, and
+# records the push in $NOTIFY_STATE_FILE. Running --status against a host with a
+# broken config would therefore page whoever is on call, and -- worse -- consume
+# the one-shot: the throttle is "first failure after a success always pushes",
+# so the next real hourly run would find the alert already spent and log
+# "notification suppressed" instead of paging. deploy.sh --check fans exactly
+# this across the fleet on every CI run. So: in these modes the alert primitives
+# are inert and no notification state is written. The diagnosis still prints,
+# and the exit code is still non-zero.
+REPORT_ONLY=0
+(( STATUS_ONLY || CHECK_UPDATE_ONLY )) && REPORT_ONLY=1
+
 SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 
 # ---- Small helpers (needed while validating the config) ----
@@ -268,6 +282,7 @@ curl_cfg_quote() {
 }
 
 ping_dms() {
+  (( REPORT_ONLY )) && return 0
   [[ -n "$PING_URL" ]] || return 0
   {
     printf 'url = "%s"\n' "$(curl_cfg_quote "$1")"
@@ -277,6 +292,7 @@ ping_dms() {
 
 ntfy() {
   local topic="$1" priority="$2" tags="$3" title="$4" body="$5"
+  (( REPORT_ONLY )) && return 0
   [[ -n "$NTFY_URL" ]] || return 0
   {
     printf 'url = "%s"\n'              "$(curl_cfg_quote "$NTFY_URL/$topic")"
@@ -301,6 +317,7 @@ ntfy() {
 #                                       or never again if that is 0
 # Returns 0 if this event should be pushed. Always records the attempt.
 notify_should_push() {
+  (( REPORT_ONLY )) && return 1     # never push, and never record an attempt
   local hard="$1" now first last hardflag
   now=$(date +%s)
   if [[ ! -s "$NOTIFY_STATE_FILE" ]]; then
@@ -342,6 +359,8 @@ This host could not start a backup at all:
 $1
 
 Nothing was backed up, and nothing will be until this is fixed."
+  elif (( REPORT_ONLY )); then
+    log "NOTICE: diagnostic mode -- no alert sent, no notification state written"
   else
     log "NOTICE: notification suppressed (already alerted)"
   fi
@@ -512,7 +531,11 @@ notify_failure() {
   if (( MAX_AGE_SEC > 0 && age >= MAX_AGE_SEC )); then hard=1; fi
   if (( ${LAST_SUCCESS:-0} > 0 )); then last_txt="$(date -d "@$LAST_SUCCESS" '+%Y-%m-%d %H:%M') ($(fmt_age "$ALERT_AGE_SEC") ago)"; fi
   if ! notify_should_push "$hard"; then
-    log "NOTICE: '$stage' failed (exit $code); notification suppressed (already alerted, age $(fmt_age "$ALERT_AGE_SEC"))"
+    if (( REPORT_ONLY )); then
+      log "NOTICE: '$stage' failed (exit $code); diagnostic mode -- no alert sent"
+    else
+      log "NOTICE: '$stage' failed (exit $code); notification suppressed (already alerted, age $(fmt_age "$ALERT_AGE_SEC"))"
+    fi
     return 0
   fi
   ntfy "$NTFY_TOPIC_HIGH" urgent rotating_light \
