@@ -19,6 +19,7 @@ set -euo pipefail
 #   ./deploy.sh                 plan, show diffs, ask, then apply
 #   ./deploy.sh --check         change nothing; report each host's --status
 #   ./deploy.sh --dry-run       plan and diff only
+#   DIFF_LINES=0 ./deploy.sh    show every diff line (default: first 60 per file)
 #   ./deploy.sh --host srv01    just that host (repeatable)
 #   ./deploy.sh --yes           skip the confirmation prompt; required when
 #                               stdin is not a terminal (cron, CI)
@@ -167,19 +168,60 @@ if (( pending == 0 )); then
   (( ${#unreachable[@]} )) && exit 1; exit 0
 fi
 
-if (( DRY_RUN )); then
+# The banner at the top of this file promises "a diff shown before anything is
+# written", and the whole push-not-pull argument rests on that being true: this
+# ships code that runs as root on every host, and the safeguard is a human
+# reading what changes. But the diff lived inside the --dry-run branch, which
+# exits, so the interactive path went plan table -> prompt -> push, asking for
+# approval of a one-word "TO UPDATE" column. Only restic-backup.sh was ever
+# diffed, too: a hand-edited remote `excludes` and the rendered cron entry were
+# both replaced sight unseen.
+DIFF_LINES="${DIFF_LINES:-60}"         # per file; 0 = no limit
+
+diff_one() {                           # diff_one <addr> <host> <remote-path> <local-file> [label]
+  local addr="$1" host="$2" remote="$3" src="$4" label="${5:-local:$(basename "$4")}" out n
+  out="$(ssh -n "${SSH_OPTS[@]}" "$addr" "cat $(rq "$remote") 2>/dev/null" \
+         | diff -u --label "$host:$remote" --label "$label" - "$src" || true)"
+  printf '\n--- %s: %s ---\n' "$host" "$remote"
+  if [[ -z "$out" ]]; then
+    printf '  (identical -- forced push)\n'
+    return 0
+  fi
+  n=$(printf '%s\n' "$out" | wc -l)
+  if (( DIFF_LINES > 0 && n > DIFF_LINES )); then
+    # sed, not head: head exits at the limit and the SIGPIPE that gives printf
+    # fails the pipeline under `set -o pipefail`, which would abort the deploy
+    # on the first diff long enough to be truncated.
+    printf '%s\n' "$out" | sed -n "1,${DIFF_LINES}p"
+    printf '  ... %d more lines (DIFF_LINES=0 to see all)\n' $(( n - DIFF_LINES ))
+  else
+    printf '%s\n' "$out"
+  fi
+  return 0
+}
+
+show_diffs() {
+  local h a
   for h in "${HOSTS[@]}"; do
-    [[ "${PLAN[$h]}" == *script* ]] || continue
-    printf '\n--- %s: %s ---\n' "$h" "$SBIN_PATH"
-    ssh "${SSH_OPTS[@]}" "$(addr_of "$h")" "cat '$SBIN_PATH' 2>/dev/null" \
-      | diff -u - "$SRC_DIR/restic-backup.sh" | head -40 || true
+    [[ -n "${PLAN[$h]}" && "${PLAN[$h]}" != unreachable ]] || continue
+    a="$(addr_of "$h")"
+    [[ "${PLAN[$h]}" == *script*   ]] && diff_one "$a" "$h" "$SBIN_PATH" "$SRC_DIR/restic-backup.sh"
+    [[ "${PLAN[$h]}" == *excludes* ]] && diff_one "$a" "$h" "$CONFIG_DIR/excludes" "$SRC_DIR/excludes"
+    [[ "${PLAN[$h]}" == *cron*     ]] && diff_one "$a" "$h" "$CRON_PATH" "${CRONTMP[$h]}" \
+                                                  "local:restic-backup.cron (minute ${CRON_MINUTE[$h]:-?})"
   done
+  return 0
+}
+
+if (( DRY_RUN )); then
+  show_diffs
   for t in "${CRONTMP[@]}"; do rm -f "$t"; done
   exit 0
 fi
 
 if (( ! ASSUME_YES )); then
   [[ -t 0 ]] || { echo "Not a terminal; re-run with --yes." >&2; exit 1; }
+  show_diffs
   read -r -p $'\nPush to the hosts listed above? [y/N] ' ans
   [[ "$ans" == [yY]* ]] || { echo "Aborted."; for t in "${CRONTMP[@]}"; do rm -f "$t"; done; exit 1; }
 fi
