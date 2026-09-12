@@ -88,6 +88,14 @@ warn_no_cron() {
 addr_of() { [[ "$1" == *@* ]] && printf '%s' "$1" || printf '%s@%s' "$SSH_USER" "$1"; }
 sha_of()  { sha256sum "$1" | awk '{print $1}'; }
 
+# Single-quote a value for the remote shell. Everything here crosses an ssh
+# command line, which means it is expanded TWICE -- once locally, once by the
+# remote shell -- and the paths come from deploy.conf, which is sourced as bash
+# and so is full-trust local input. This is not a privilege boundary; it is what
+# keeps a path containing a quote or a space from silently building a different
+# command on the far side.
+rq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
 # Rewrite the shipped cron template for ONE host: its own minute, and whatever
 # paths deploy.conf uses.
 render_cron() {
@@ -181,11 +189,28 @@ fi
 # be RUNNING, and bash reads its own source as it goes -- overwriting it in
 # place makes a live run execute whatever lands at that offset. rename(2) hands
 # the running process its old inode and is atomic.
-push() {                               # <local> <remote-dest> <mode>
-  local src="$1" dest="$2" mode="$3" tmp="/tmp/.deploy-$$-${RANDOM}"
-  scp "${SSH_OPTS[@]}" -q "$src" "$addr:$tmp"
-  ssh "${SSH_OPTS[@]}" "$addr" \
-    "install -D -m '$mode' '$tmp' '$dest.new' && mv -f '$dest.new' '$dest' && rm -f '$tmp'"
+# The staging file lives in the DESTINATION directory, which is root-owned, and
+# the content arrives on ssh's stdin rather than through scp. It used to be
+# staged at /tmp/.deploy-$$-$RANDOM, which is a guessable name in a directory
+# every local user can write: $$ is fixed for a whole deploy run and visible in
+# the name of the first staged file, $RANDOM is 15 bits, and scp opens its
+# destination O_CREAT|O_TRUNC as root with no O_EXCL and no O_NOFOLLOW. Any
+# unprivileged user on a target could pre-create the 32768 candidate symlinks,
+# have root truncate and fill whatever one of them pointed at, and then have
+# `install` copy back through it into /usr/local/sbin/restic-backup.sh -- which
+# is to say, choose the contents of an hourly root cron job. /tmp being sticky
+# does not help when the name does not exist yet.
+push() {                               # push <local> <remote-dest> <mode> [dir-mode]
+  local src="$1" dest="$2" mode="$3" dirmode="${4:-755}"
+  ssh "${SSH_OPTS[@]}" "$addr" "
+    set -eu
+    dest=$(rq "$dest"); dir=\$(dirname \"\$dest\")
+    [ -d \"\$dir\" ] || install -d -m $(rq "$dirmode") \"\$dir\"
+    umask 077
+    cat > \"\$dest.new\"
+    chmod $(rq "$mode") \"\$dest.new\"
+    mv -f \"\$dest.new\" \"\$dest\"
+  " < "$src"
 }
 
 rc=0
@@ -195,7 +220,7 @@ for h in "${HOSTS[@]}"; do
   printf '\n=== %s ===\n' "$h"
   ok=1
   [[ "${PLAN[$h]}" == *script*   ]] && { push "$SRC_DIR/restic-backup.sh" "$SBIN_PATH" 755        || ok=0; }
-  [[ "${PLAN[$h]}" == *excludes* ]] && { push "$SRC_DIR/excludes" "$CONFIG_DIR/excludes" 644      || ok=0; }
+  [[ "${PLAN[$h]}" == *excludes* ]] && { push "$SRC_DIR/excludes" "$CONFIG_DIR/excludes" 644 700  || ok=0; }
   [[ "${PLAN[$h]}" == *cron*     ]] && { push "${CRONTMP[$h]}" "$CRON_PATH" 644                   || ok=0; }
   if (( ok )); then
     ssh "${SSH_OPTS[@]}" "$addr" "'$SBIN_PATH' --status" || { echo "  (--status failed)"; rc=1; }
