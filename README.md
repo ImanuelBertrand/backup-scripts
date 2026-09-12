@@ -181,6 +181,12 @@ install -m 644 excludes /root/.config/restic/excludes
 install -m 600 config.sample /root/.config/restic/config
 ```
 
+The modes above are not cosmetic. `config` and the optional `pre-backup` hook are
+*executed* as root on every run, so the script refuses to start unless each one —
+and every directory on the way to it — is owned by root (or by the user running
+it) and not writable by group or other. If you move `CONFIG_DIR` somewhere else,
+carry the `700` with it.
+
 ### 3.2 Encryption password
 
 This is what actually protects the data at rest, and it is **separate** from the
@@ -672,7 +678,8 @@ which is usually what you actually want.
 | Per-client encryption password | The backup host's storage being read or stolen. |
 | `:ro` auth mount, `no-new-privileges` | A compromised rest-server container rewriting credentials or escalating. |
 | `$DUMP_DIR` wiped on exit, mode `0700` | Plaintext database dumps lingering on client disks. |
-| Secrets via env / container env, never argv | Passwords appearing in the host process list. |
+| Secrets via env / container env / `curl -K`, never argv | Passwords appearing in the host process list. |
+| `config` and `pre-backup` refused unless root-owned and not group/world-writable | A writable config turning the hourly root cron job into unattended root code execution. |
 | No self-update path; clients never fetch code | One compromised GitHub credential becoming root on every host within the hour. |
 
 Not covered: the maintenance host is a single point of trust — it holds every

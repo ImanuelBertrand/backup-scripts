@@ -53,7 +53,13 @@ set -euo pipefail
 # Requires restic >= 0.16 (--retry-lock). Keep client restic <= maintenance host.
 # ============================================================================
 
-export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+# Absolute and CLOSED -- the inherited PATH is deliberately NOT appended. This
+# script runs as root and resolves `ip`, `nmcli`, `restic`, `flock` and the dump
+# tools by name; keeping a caller-supplied tail in PATH would let a poisoned
+# environment (a manual run, a wrapper, a non-cron scheduler) satisfy any of
+# them from a directory it controls. sbin is included because `ip` lives in
+# /usr/sbin on distributions that are not usr-merged.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # ---- Arguments ----
 FORCE="${FORCE:-0}"
@@ -125,6 +131,47 @@ write_state() {                        # write_state FILE LINE...
   return 0
 }
 
+# ---- Trusted paths -------------------------------------------------------
+# `source config` and the pre-backup hook both EXECUTE their file as root, once
+# an hour, unattended. Existence is therefore not a sufficient check: anything
+# that can write the file -- or write the directory holding it, which amounts to
+# the same thing -- owns root on this host by the next tick. The README installs
+# these 700/600, but a restore with wrong ownership, a hand-created directory or
+# a CONFIG_DIR moved somewhere laxer all defeat that, silently. Verify instead.
+#
+# "Trusted" = owned by root or by us, and not writable by group or other, for
+# the file and for EVERY directory on the way to it.
+path_is_trusted() {                    # path -> 0 if nobody else can write it
+  local p="$1" owner mode
+  owner=$(stat -Lc %u "$p" 2>/dev/null) || return 1
+  mode=$(stat -Lc %a "$p" 2>/dev/null)  || return 1
+  (( owner == 0 || owner == EUID )) || return 1
+  # A sticky world-writable DIRECTORY (/tmp) is fine: only the owner can rename
+  # or unlink an entry, so an existing file in it cannot be swapped out. The
+  # same bits on a file, or on a non-sticky directory, are not.
+  if [[ -d "$p" ]] && (( 8#$mode & 01000 )); then return 0; fi
+  (( 8#$mode & 0022 )) && return 1
+  return 0
+}
+
+require_trusted() {                    # require_trusted PATH DESCRIPTION
+  local p="$1" desc="$2" d
+  if ! path_is_trusted "$p"; then
+    echo "FATAL: $desc ($p) must be owned by root or UID $EUID and not group/world-writable" >&2
+    echo "FATAL: it is executed as UID $EUID; anyone who can write it owns this host." >&2
+    exit 1
+  fi
+  d="$(dirname "$(readlink -f "$p")")"
+  while :; do
+    if ! path_is_trusted "$d"; then
+      echo "FATAL: $desc ($p) sits under a directory anyone can write ($d)" >&2
+      exit 1
+    fi
+    [[ "$d" == / ]] && break
+    d="$(dirname "$d")"
+  done
+}
+
 # Every integer knob goes through here, so the default lives in exactly ONE
 # place: it seeds the value when the config is silent AND it is what a
 # malformed value falls back to. Falling back to the DEFAULT rather than to 0
@@ -146,6 +193,7 @@ int_cfg() {                            # int_cfg NAME DEFAULT
 # ---- Load per-host config ----
 CONFIG_DIR="${RESTIC_CONFIG_DIR:-$HOME/.config/restic}"
 [[ -f "$CONFIG_DIR/config" ]] || { echo "FATAL: missing $CONFIG_DIR/config" >&2; exit 1; }
+require_trusted "$CONFIG_DIR/config" "the config"
 # shellcheck disable=SC1091
 source "$CONFIG_DIR/config"
 # NOTE: restic authenticates to rest-server via HTTP Basic Auth on EVERY request --
@@ -752,13 +800,21 @@ ping_dms "$PING_URL/start"
 PRE_BACKUP_HOOK="${PRE_BACKUP_HOOK:-$CONFIG_DIR/pre-backup}"   # optional generic hook
 cleanup_dumps() { rm -rf "${DUMP_DIR:?}"/* 2>/dev/null || true; }
 if _have_db_config || [[ -x "$PRE_BACKUP_HOOK" ]]; then
-  mkdir -p "$DUMP_DIR"; chmod 700 "$DUMP_DIR"
+  # A symlinked $DUMP_DIR would send every plaintext dump through it and have
+  # the chmod land on the target, so refuse one outright; -m 700 keeps the
+  # directory from existing world-readable even for the instant between mkdir
+  # and chmod (the chmod stays, for a directory that already exists).
+  [[ ! -L "$DUMP_DIR" ]] || { echo "FATAL: \$DUMP_DIR ($DUMP_DIR) is a symlink" >&2; exit 1; }
+  mkdir -p -m 700 "$DUMP_DIR"; chmod 700 "$DUMP_DIR"
   trap 'cleanup_dumps' EXIT
   cleanup_dumps                       # clear any junk a crashed run left
   __um=$(umask); umask 077            # dumps are 0600
   run_db_dumps
   umask "$__um"
-  [[ -x "$PRE_BACKUP_HOOK" ]] && { export DUMP_DIR; run_step "pre-backup-hook" "$PRE_BACKUP_HOOK"; }
+  [[ -x "$PRE_BACKUP_HOOK" ]] && {
+    require_trusted "$PRE_BACKUP_HOOK" "the pre-backup hook"
+    export DUMP_DIR; run_step "pre-backup-hook" "$PRE_BACKUP_HOOK"
+  }
   # Any artifact counts, not just *.sql -- the hook is generic and may write
   # anything. (A failing compgen here is exempt from set -e: it precedes the &&.)
   compgen -G "$DUMP_DIR/*" >/dev/null && BACKUP_PATHS+=("$DUMP_DIR")
