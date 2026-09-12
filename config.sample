@@ -14,6 +14,14 @@
 # apply, and arrays use (parentheses).
 # =============================================================================
 
+# ---- PATH (only if restic is somewhere unusual) -----------------------------
+# The script runs with a fixed PATH of /usr/local/sbin:/usr/local/bin:/usr/sbin:
+# /usr/bin:/sbin:/bin and does NOT inherit the caller's, so that a poisoned
+# environment cannot decide which `restic` or `ip` it runs. If restic lives
+# outside those -- a snap (/snap/bin), /opt, a Go workspace -- add it here. This
+# file is only sourced after its ownership has been verified.
+# export PATH="/snap/bin:$PATH"
+
 # ---- Repository (where backups go) -----------------------------------------
 # rest-server URL. The host is reachable only over the WireGuard tunnel.
 export RESTIC_REPOSITORY="rest:http://10.0.0.2:8000/CHANGE-ME/"

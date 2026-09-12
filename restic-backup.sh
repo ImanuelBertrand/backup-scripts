@@ -59,6 +59,11 @@ set -euo pipefail
 # environment (a manual run, a wrapper, a non-cron scheduler) satisfy any of
 # them from a directory it controls. sbin is included because `ip` lives in
 # /usr/sbin on distributions that are not usr-merged.
+#
+# If restic (or anything else this needs) lives somewhere else -- /opt, /snap/bin
+# for a snap install, a Go workspace -- extend it from the config, which is
+# sourced below and is verified to be root-owned before it is:
+#     export PATH="/snap/bin:$PATH"
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # ---- Arguments ----
@@ -741,6 +746,18 @@ excluded_prefixes() {
   grep -E '^/[^*?[]*$' "$EXCLUDE_FILE" 2>/dev/null | sed 's:/\+$::' || true
 }
 
+# PATH is deliberately closed (see the top of this file), so "restic is
+# installed" and "restic is reachable from here" are different questions -- a
+# snap or /opt install answers yes to the first and no to the second. Asking now
+# turns an exit 127 in the middle of a run into one clear, throttled page.
+check_restic_present() {
+  command -v restic >/dev/null 2>&1 || preflight_fail \
+"restic is not on this script's PATH ($PATH).
+If it is installed somewhere else -- /snap/bin, /opt, a Go workspace -- add that
+directory from $CONFIG_DIR/config, which is sourced with a verified owner:
+    export PATH=\"/snap/bin:\$PATH\""
+}
+
 check_backup_sources() {
   local p
   for p in "${BACKUP_PATHS[@]}"; do
@@ -978,6 +995,7 @@ log "Due: $DUE_REASON"
 # Only on a run that is actually going to back up: a source that is missing or
 # unmounted is a reason to page, but not a reason to page on an hour we were
 # going to skip anyway.
+check_restic_present
 check_backup_sources
 check_one_file_system_coverage
 
