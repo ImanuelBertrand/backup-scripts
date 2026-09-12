@@ -423,7 +423,7 @@ heal itself) but go through the same throttle, so it is one page, then
 
 ### 4.4 Inspect the decision
 
-`--status` prints what the script would do and changes nothing:
+`--status` prints what the script would do, and alerts nobody:
 
 ```console
 # restic-backup.sh --status
@@ -431,10 +431,15 @@ last success : 2026-09-11 23:24:07 (6h29m ago)
 window       : 23-06  (now 05:53 -> inside)
 thresholds   : min-interval 20h, catch-up 24h, hard-fail 36h
 stale        : no
+mounts       : all mounts covered
+version      : matches published (checked 3h12m ago)
 decision     : not due, would skip
 ```
 
-It changes nothing, but it does report through its exit code, so it works as a
+It sends no notification and consumes none of the alerting state — the one
+thing it does write is `.first-seen`, which starts the staleness clock on a host
+that has never backed up, and without which a host whose cron never fires would
+report healthy forever. It reports through its exit code, so it works as a
 health probe on its own:
 
 | Exit | Meaning |
@@ -693,7 +698,7 @@ $EDITOR deploy.conf
 
 ./deploy.sh                 # plan → diff → confirm → push → show each --status
 ./deploy.sh --dry-run       # plan and diff only
-./deploy.sh --check         # change nothing; print every host's --status
+./deploy.sh --check         # alert nobody; print every host's --status
                             # exits non-zero on a stale, unreachable or
                             # unscheduled host, so it works as a CI gate
 ./deploy.sh --host srv01    # one host (repeatable)

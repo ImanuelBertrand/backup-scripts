@@ -47,7 +47,7 @@ set -euo pipefail
 # page you (see notify_failure) -- 24 invocations a day must not mean 24 pushes.
 #
 # Run by hand with --force (bypass every gate) or --status (print the decision
-# and change nothing).
+# and report through the exit code, alerting nobody).
 # ---------------------------------------------------------------------------
 #
 # Requires restic >= 0.16 (--retry-lock). Keep client restic <= maintenance host.
@@ -84,7 +84,7 @@ Usage: restic-backup.sh [--force] [--status] [--check-update]
 
   --force         back up now, ignoring the window / min-interval / metered
                   gates (reachability still applies -- nowhere to push to)
-  --status        print the scheduling decision and exit; changes nothing.
+  --status        print the scheduling decision and exit; alerts nobody.
                   Exit 0 healthy, 3 past MAX_BACKUP_AGE_HOURS, 1 cannot tell
   --check-update  compare this file against the published version and report.
                   NEVER downloads or installs anything -- deploy with deploy.sh
@@ -101,8 +101,11 @@ while (( $# )); do
   shift
 done
 
-# --status and --check-update are diagnostic: they must change nothing anyone
-# else can observe. Every config guard below reaches preflight_fail, which is an
+# --status and --check-update are diagnostic: they must SPEND nothing anyone
+# else is waiting on. (Not "change nothing": --status does seed .first-seen, and
+# has to -- see the comment there. The distinction is starting a clock, which is
+# free, against consuming a one-shot, which is not.)
+# Every config guard below reaches preflight_fail, which is an
 # ALERTING path -- it pings the dead-man's switch, pushes an urgent ntfy, and
 # records the push in $NOTIFY_STATE_FILE. Running --status against a host with a
 # broken config would therefore page whoever is on call, and -- worse -- consume
