@@ -175,7 +175,15 @@ WG_INTERFACE=""                                    # e.g. "wg0"
 NTFY_URL="https://ntfy.example.com"
 NTFY_TOPIC_HIGH="backups-high"                     # topic for urgent failures
 NTFY_TOPIC_LOW=""                                  # topic for version drift; "" = log only
-NTFY_TOKEN="CHANGE-ME"                             # SECRET -- do not commit; "" if topic is open
+# SECRET -- do not commit. An empty token only works on a topic with no access
+# control, and on ntfy.sh (and any ntfy with default ACLs) that means ANYONE who
+# guesses the topic name can read it -- "backups-high" being an obvious guess.
+# The messages carry the hostname, the failing stage, the time of the last good
+# backup and 1500 bytes of restic / pg_dumpall stderr: host inventory, paths,
+# database names, and a live signal of which host has stopped backing up. Use a
+# token and an access-controlled topic; if you must run an open one, make the
+# topic name a random string and treat it as the only thing keeping it private.
+NTFY_TOKEN="CHANGE-ME"
 
 # ---- Dead-man's-switch ping (healthchecks.io or self-hosted) ----------------
 # Script pings $URL/start at begin, $URL on success, $URL/fail on failure. If

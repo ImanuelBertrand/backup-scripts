@@ -24,7 +24,17 @@ services:
       - /share/Backups/restic/auth:/auth:ro          # read-only: a compromised container can't rewrite creds
 
     ports:
-      - "8000:8000"
+      # Bound to the WIREGUARD address, not 0.0.0.0. The whole security model is
+      # "WireGuard is the transport, so there is no TLS" -- and a published
+      # Docker port defeats it: Docker inserts its DNAT rules ahead of the
+      # firewalld/ufw INPUT chain, so "8000:8000" listens on every interface,
+      # public ones included, and firewall rules meant to stop that never see the
+      # packet. The server would then be answering HTTP Basic auth in cleartext
+      # off-tunnel. --append-only and --private-repos limit what a stolen
+      # credential is worth; they do not stop it being sniffed or brute-forced.
+      #
+      # Set this to THIS host's address inside the tunnel.
+      - "10.0.0.2:8000:8000"
 
     security_opt:
       - no-new-privileges:true

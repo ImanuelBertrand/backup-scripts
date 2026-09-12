@@ -103,6 +103,13 @@ docker compose up -d
 docker compose logs -f rest-server
 ```
 
+The published port is bound to `10.0.0.2:8000` — this host's address *inside the
+tunnel* — and not to `0.0.0.0`. Change it to match your own WireGuard address.
+Docker inserts its port-forwarding rules ahead of the firewalld/ufw `INPUT`
+chain, so a plain `"8000:8000"` listens on every interface including public ones
+and your firewall rules never see the traffic. Since there is deliberately no TLS
+here, that would mean HTTP Basic auth in cleartext on the open internet.
+
 Sanity check from a client, over the tunnel:
 
 ```bash
@@ -111,7 +118,9 @@ curl -i http://10.0.0.2:8000/          # 401 is the CORRECT answer -- auth is on
 
 A `401` means reachable and authenticating. A timeout means the tunnel is down.
 If you get `200` without credentials, `DISABLE_AUTHENTICATION` leaked in
-somewhere — stop and fix it before seeding any data.
+somewhere — stop and fix it before seeding any data. From a machine *outside*
+the tunnel the same request should time out; if it answers, the bind address is
+wrong.
 
 > **Decide `--private-repos` before seeding.** It fixes every client's repo URL
 > to `/<user>/`. Changing it later rewrites every client's URL.
@@ -193,9 +202,12 @@ This is what actually protects the data at rest, and it is **separate** from the
 rest-server login. Generate one per client:
 
 ```bash
-openssl rand -base64 32 > /root/.config/restic/encryption-pw
-chmod 600 /root/.config/restic/encryption-pw
+( umask 077; openssl rand -base64 32 > /root/.config/restic/encryption-pw )
 ```
+
+(The `umask` is not decoration: `> file` creates it under root's default 022,
+so writing first and `chmod`-ing after leaves the password world-readable in
+between — and permanently so if only the first line gets pasted.)
 
 > **Store this somewhere off the machine — a password manager, printed in a
 > safe.** If the host dies and this password is gone, its backups are
