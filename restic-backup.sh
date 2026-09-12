@@ -101,7 +101,11 @@ fmt_age() {                            # seconds -> "12h34m" ("never" for < 0)
 read_epoch() {                         # file -> epoch on stdout, 0 if unusable
   local f="$1" v=0
   if [[ -s "$f" ]]; then
-    read -r v < "$f" || v=0
+    # `read` returns 1 at EOF-without-newline, but only AFTER assigning v, so a
+    # value written with `echo -n` (repairing state by hand, say) would be thrown
+    # away here and read as "no successful backup ever". The regex below is what
+    # actually validates it.
+    read -r v < "$f" || true
     [[ "$v" =~ ^[0-9]+$ ]] || v=0
   fi
   printf '%s' "$v"
@@ -109,12 +113,15 @@ read_epoch() {                         # file -> epoch on stdout, 0 if unusable
 
 # read_epoch's counterpart, and the ONLY way this script writes a state file.
 # Two properties, both load-bearing:
-#   atomic      -- `> file` truncates before it writes, so losing power inside
-#                  that window leaves a 0-byte .last-success. read_epoch then
-#                  reports 0, the scheduler reads "no successful backup ever",
+#   atomic      -- writes $f.tmp and renames it into place, so the file is
+#                  always either the old value or the new one. A plain `> file`
+#                  truncates before it writes, and losing power inside that
+#                  window leaves a 0-byte .last-success: read_epoch reports 0,
+#                  the scheduler reads "no successful backup ever",
 #                  ALERT_AGE_SEC falls back to .first-seen, and on a host with
 #                  months of history the next ordinary failure pages "No
-#                  successful backup for 8760h00m".
+#                  successful backup for 8760h00m". (Not fsynced: a crash can
+#                  still lose the write, but it cannot leave a truncated file.)
 #   never fatal -- under `set -e` a failed write (read-only /, full disk) would
 #                  abort the script, and in version_check that runs AFTER the
 #                  backup succeeded: the ERR trap would page "Backup FAILED"
@@ -490,10 +497,14 @@ version_status() {
   fi
 }
 
+# $4 is the age the hard/soft decision is made on. It defaults to the age of the
+# last success, which is right for every failure except losing the lock, where
+# the number that matters is how long the HOLDER has been running -- see
+# stale_exit and the lock section.
 notify_failure() {
-  local stage="$1" code="$2" output="$3" hard=0 last_txt="never"
+  local stage="$1" code="$2" output="$3" age="${4:-$ALERT_AGE_SEC}" hard=0 last_txt="never"
   ping_dms "$PING_URL/fail"
-  if (( MAX_AGE_SEC > 0 && ALERT_AGE_SEC >= MAX_AGE_SEC )); then hard=1; fi
+  if (( MAX_AGE_SEC > 0 && age >= MAX_AGE_SEC )); then hard=1; fi
   if (( ${LAST_SUCCESS:-0} > 0 )); then last_txt="$(date -d "@$LAST_SUCCESS" '+%Y-%m-%d %H:%M') ($(fmt_age "$ALERT_AGE_SEC") ago)"; fi
   if ! notify_should_push "$hard"; then
     log "NOTICE: '$stage' failed (exit $code); notification suppressed (already alerted, age $(fmt_age "$ALERT_AGE_SEC"))"
@@ -858,13 +869,23 @@ in_backup_window() {
 # locally, without waiting on the external dead-man's switch. Both paths use
 # MAX_BACKUP_AGE_HOURS; they differ only in which age they compare against.
 # Exits 1 when stale (a real failure), else 0.
+# $2 is the age to judge, defaulting to the age of the last success. The lock
+# path passes the holder's age instead, and used to only be able to ask for the
+# check while this function silently made it against ALERT_AGE_SEC anyway. That
+# happens to give the same answer today -- a holder cannot have written
+# .last-success yet, so the last success is always at least as old as the lock --
+# but it contradicted the comments either side of it, and any future change to
+# .first-seen handling, or forward clock skew, would have turned the documented
+# "page when the holder is wedged" into a silent exit 0.
 stale_exit() {
-  local reason="$1"
-  if (( MAX_AGE_SEC > 0 && ALERT_AGE_SEC >= MAX_AGE_SEC )); then
-    log "STALE: no successful backup for $(fmt_age "$ALERT_AGE_SEC") (limit ${MAX_BACKUP_AGE_HOURS}h)."
+  local reason="$1" age="${2:-$ALERT_AGE_SEC}"
+  if (( MAX_AGE_SEC > 0 && age >= MAX_AGE_SEC )); then
+    # Phrased for both callers: on the lock path $age is how long the holder has
+    # been running, which is equally "this long without a completed backup".
+    log "STALE: $(fmt_age "$age") without a completed backup (limit ${MAX_BACKUP_AGE_HOURS}h)."
     notify_failure "stale: $reason" 1 \
-"No successful backup for $(fmt_age "$ALERT_AGE_SEC") -- limit is ${MAX_BACKUP_AGE_HOURS}h.
-This run did not back up: $reason"
+"$(fmt_age "$age") without a completed backup -- limit is ${MAX_BACKUP_AGE_HOURS}h.
+This run did not back up: $reason" "$age"
     exit 1
   fi
   exit 0
@@ -941,7 +962,7 @@ else
   held="$(lock_held_secs)"
   log "Another run has held the lock for $(fmt_age "$held"); exiting."
   if (( MAX_AGE_SEC > 0 && held >= MAX_AGE_SEC )); then
-    stale_exit "another run has been stuck for $(fmt_age "$held")"
+    stale_exit "another run has been stuck for $(fmt_age "$held")" "$held"
   fi
   exit 0
 fi
@@ -1108,7 +1129,7 @@ run_step "backup" restic backup \
   --retry-lock "$LOCK_WAIT" \
   --exclude-caches \
   --exclude-file "$EXCLUDE_FILE" \
-  "${EXTRA_BACKUP_ARGS[@]}" \
+  ${EXTRA_BACKUP_ARGS+"${EXTRA_BACKUP_ARGS[@]}"} \
   "${BACKUP_PATHS[@]}"
 
 # No forget/prune/check here (append-only; retention lives on the maintenance host).
@@ -1117,9 +1138,12 @@ run_step "backup" restic backup \
 # .last-success is written ONLY here, and only after restic returned 0. Every
 # scheduling and staleness decision reads it; a lock-skip or a failed run must
 # never touch it, or a wedged host would look freshly backed up.
+# `|| true` for the same reason write_state never fails: these run AFTER restic
+# returned 0, and under set -e with the ERR trap armed a read-only / would turn
+# a backup that worked into an urgent "Backup FAILED" push.
 write_state "$LAST_SUCCESS_FILE" "$(date +%s)"
-rm -f "$NOTIFY_STATE_FILE"            # failure streak is over; next failure pages again
-rm -f "$WG_BOUNCE_FILE"               # tunnel is fine; the next outage may bounce at once
+rm -f "$NOTIFY_STATE_FILE" || true    # failure streak is over; next failure pages again
+rm -f "$WG_BOUNCE_FILE"    || true    # tunnel is fine; the next outage may bounce at once
 
 log "Backup complete."
 ping_dms "$PING_URL"
