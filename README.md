@@ -829,3 +829,10 @@ maintenance host cannot reach.
 
 If you ever keep a filled-in `config` inside a git repo, add a `.gitignore` with
 `config` and `encryption-pw` first — or better, keep them out of git entirely.
+
+---
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). The scripts run as root and handle your backups;
+there is no warranty, so read them before you deploy them.
