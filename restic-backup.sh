@@ -98,6 +98,24 @@ read_epoch() {                         # file -> epoch on stdout, 0 if unusable
   printf '%s' "$v"
 }
 
+# Every integer knob goes through here, so the default lives in exactly ONE
+# place: it seeds the value when the config is silent AND it is what a
+# malformed value falls back to. Falling back to the DEFAULT rather than to 0
+# is the whole point -- 0 is meaningful for most of these knobs ("never
+# hard-fail on age", "never re-page"), so coercing a typo to 0 would quietly
+# switch off the alarm the config was trying to set. An explicit 0 is kept.
+int_cfg() {                            # int_cfg NAME DEFAULT
+  local _n="$1" _d="$2" _raw
+  declare -n _ref="$_n"
+  _raw="${_ref:-$_d}"
+  if [[ ! "$_raw" =~ ^[0-9]+$ ]]; then
+    log "WARN: $_n='$_raw' is not a whole number of hours; using the default $_d."
+    log "WARN: Fix $CONFIG_DIR/config -- a typo here must not disable the check."
+    _raw="$_d"
+  fi
+  _ref="$_raw"
+}
+
 # ---- Load per-host config ----
 CONFIG_DIR="${RESTIC_CONFIG_DIR:-$HOME/.config/restic}"
 [[ -f "$CONFIG_DIR/config" ]] || { echo "FATAL: missing $CONFIG_DIR/config" >&2; exit 1; }
@@ -118,34 +136,27 @@ SKIP_IF_METERED="${SKIP_IF_METERED:-false}"
 
 # Scheduling / staleness. Hours; 0 disables that particular rule.
 BACKUP_WINDOW="${BACKUP_WINDOW:-23-06}"              # "" = no window
-MIN_INTERVAL_HOURS="${MIN_INTERVAL_HOURS:-20}"
-FORCE_AFTER_HOURS="${FORCE_AFTER_HOURS:-24}"
-MAX_BACKUP_AGE_HOURS="${MAX_BACKUP_AGE_HOURS:-36}"   # 0 = never hard-fail on age
-NOTIFY_REPEAT_HOURS="${NOTIFY_REPEAT_HOURS:-12}"     # re-page interval while stale
+int_cfg MIN_INTERVAL_HOURS   20
+int_cfg FORCE_AFTER_HOURS    24
+int_cfg MAX_BACKUP_AGE_HOURS 36                      # 0 = never hard-fail on age
+int_cfg NOTIFY_REPEAT_HOURS  12                      # re-page interval while stale
 
 # Version drift. REPORT ONLY -- this script never downloads or installs code.
 # Knowing which host is running an old copy is the whole point; updating is
 # deploy.sh's job, from a machine you are sitting at.
 VERSION_CHECK_URL="${VERSION_CHECK_URL:-}"           # "" = disabled
-VERSION_CHECK_INTERVAL_HOURS="${VERSION_CHECK_INTERVAL_HOURS:-24}"
+int_cfg VERSION_CHECK_INTERVAL_HOURS 24
 
 # WireGuard self-heal: bounce the tunnel once if the backend is unreachable.
 WG_INTERFACE="${WG_INTERFACE:-}"                     # "" = never touch the tunnel
 WG_RESTART_CMD="${WG_RESTART_CMD:-}"                 # overrides the built-in logic
-WG_SETTLE_SECS="${WG_SETTLE_SECS:-5}"
+int_cfg WG_SETTLE_SECS 5                             # seconds, not hours
 
 if declare -p SKIP_IF_UNREACHABLE &>/dev/null; then
   log "WARN: SKIP_IF_UNREACHABLE is obsolete and ignored -- an unreachable backend is"
   log "WARN: now always a silent skip, and MAX_BACKUP_AGE_HOURS decides when that"
   log "WARN: becomes a failure. Delete it from $CONFIG_DIR/config."
 fi
-
-for _v in MIN_INTERVAL_HOURS FORCE_AFTER_HOURS MAX_BACKUP_AGE_HOURS NOTIFY_REPEAT_HOURS \
-          VERSION_CHECK_INTERVAL_HOURS WG_SETTLE_SECS; do
-  declare -n _r="$_v"
-  if [[ ! "$_r" =~ ^[0-9]+$ ]]; then log "WARN: $_v='$_r' is not an integer; using 0"; _r=0; fi
-done
-unset -n _r; unset _v
 
 MIN_INTERVAL_SEC=$(( MIN_INTERVAL_HOURS * 3600 ))
 FORCE_AFTER_SEC=$(( FORCE_AFTER_HOURS * 3600 ))
