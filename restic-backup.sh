@@ -480,18 +480,41 @@ $(printf '%s' "$output" | tail -c 1500)"
     && notify-send -u critical "restic backup failed" "$stage (exit $code)" 2>/dev/null || true
 }
 
+# Runs one stage, streaming its output to the log AS IT HAPPENS while keeping a
+# copy for the failure notification. It used to capture into a variable and
+# print the lot afterwards, which meant the one case the lock-staleness alarm
+# exists for -- a `restic backup` wedged on a half-open WireGuard connection --
+# logged the ">>> backup" line and then nothing at all for a day and a half.
+# Kill that run and the buffer went with it, leaving nothing to diagnose from.
+#
+# 9>&- keeps the lock fd out of the child. Anything a pre-backup hook leaves
+# running in the background would otherwise inherit the flock and hold it for
+# good: every later run would report "another run has held the lock for Nh",
+# page once past MAX_BACKUP_AGE_HOURS, and never back up again. The pipe is the
+# other half of that -- with a captured $( ) the surviving child also had to
+# close stdout before this function could return.
 run_step() {
   local stage="$1"; shift
+  local tmp rc out
   log ">>> $stage"
+  tmp="$(mktemp 2>/dev/null)" || tmp=""      # 0600; /tmp is excluded from backups
   set +e
-  local out; out="$("$@" 2>&1)"; local rc=$?
+  if [[ -n "$tmp" ]]; then
+    "$@" 9>&- 2>&1 | tee "$tmp"
+    rc=${PIPESTATUS[0]}
+  else
+    "$@" 9>&- 2>&1
+    rc=$?
+  fi
   set -e
-  printf '%s\n' "$out"
   if (( rc != 0 )); then
     log "ERROR during '$stage' (exit $rc)"
-    notify_failure "$stage" "$rc" "$out"
+    out="$(tail -c 1500 "$tmp" 2>/dev/null)"
+    rm -f "$tmp"
+    notify_failure "$stage" "$rc" "${out:-see journal/log}"
     exit "$rc"
   fi
+  rm -f "$tmp"
 }
 
 trap 'rc=$?; log "ERROR: unexpected failure (line $LINENO, exit $rc)"; notify_failure script "$rc" "see journal/log"; exit $rc' ERR
@@ -962,18 +985,18 @@ wg_bounce() {
 
   if [[ -n "$WG_RESTART_CMD" ]]; then
     log "WG: running WG_RESTART_CMD"
-    if ! bash -c "$WG_RESTART_CMD"; then log "WG: WG_RESTART_CMD failed."; return 1; fi
+    if ! bash -c "$WG_RESTART_CMD" 9>&-; then log "WG: WG_RESTART_CMD failed."; return 1; fi
     sleep "$WG_SETTLE_SECS"; return 0
   fi
   # Never run wg-quick behind systemd's back: it would leave the unit thinking
   # the interface is still up.
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "wg-quick@$WG_INTERFACE"; then
     log "WG: restarting wg-quick@$WG_INTERFACE (systemd-managed)"
-    if ! systemctl restart "wg-quick@$WG_INTERFACE"; then log "WG: systemctl restart failed."; return 1; fi
+    if ! systemctl restart "wg-quick@$WG_INTERFACE" 9>&-; then log "WG: systemctl restart failed."; return 1; fi
   elif command -v wg-quick >/dev/null 2>&1; then
     log "WG: bouncing $WG_INTERFACE with wg-quick"
-    wg-quick down "$WG_INTERFACE" >/dev/null 2>&1 || true      # may already be down
-    if ! wg-quick up "$WG_INTERFACE"; then
+    wg-quick down "$WG_INTERFACE" 9>&- >/dev/null 2>&1 || true # may already be down
+    if ! wg-quick up "$WG_INTERFACE" 9>&-; then
       log "WG: 'wg-quick up $WG_INTERFACE' FAILED -- the tunnel is now DOWN."
       return 1
     fi

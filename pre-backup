@@ -28,6 +28,17 @@
 #   - Owns nothing else: no restic, no knowledge of the repo, no cleanup.
 #   - Must be installed at $CONFIG_DIR/pre-backup AND be executable, or it is
 #     skipped entirely. Hosts with nothing to prepare just omit the file.
+#   - Must be owned by root (or by whoever runs the backup) and not group- or
+#     world-writable, along with every directory above it. It runs as root, so
+#     the main script refuses to start rather than execute a file someone else
+#     could have written.
+#   - MUST NOT leave anything running in the background that keeps stdout open.
+#     The main script reads this hook's output through a pipe, and a surviving
+#     child holds that pipe -- and with it the run -- open indefinitely. Redirect
+#     anything you detach:  mydaemon >/dev/null 2>&1 &
+#   - Everything printed here reaches syslog, which on Debian/Ubuntu is readable
+#     by the `adm` group, and the tail of it is included in the failure push.
+#     Do not echo secrets, even on an error path.
 #
 # Secrets come from the host ENVIRONMENT, never from argv (argv is world-visible
 # in the process list). Put them in a root-only file and `source` it.
