@@ -14,6 +14,14 @@
 #
 # Everything excluded here is a pseudo-filesystem, a cache, or regenerable from a
 # lockfile/manifest. Persistent data is kept.
+#
+# THIS FILE IS FLEET-WIDE AND IS OVERWRITTEN BY deploy.sh. Do not hand-edit it on
+# a host -- the next deploy silently reverts you, and the only symptom is a
+# snapshot that quietly stopped containing something. Per-host patterns go in
+#     $CONFIG_DIR/excludes.local
+# which deploy.sh never touches. It is read AFTER this file, so it can also take
+# a pattern back out: "!.venv" there re-includes what the line below excludes.
+# See excludes.local.sample.
 # =============================================================================
 
 # ---- Pseudo-filesystems & volatile system dirs (relevant when backing up /) ----
@@ -31,18 +39,18 @@
 /swapfile
 /swap.img
 
-# ---- This client's own restic secrets ----
-# The encryption password inside the repository it unlocks is worse than
-# useless: it cannot help you (you need it to read the snapshot in the first
-# place), and it means anyone who obtains one snapshot's password also gets the
-# rest-server credentials and the ntfy token from `config` -- and that every
-# retired password stays in plaintext in the history for as long as the snapshot
-# does. Keep both OFF the machine, as README section 3.2 says.
+# ---- This client's own restic secrets: excluded by the script ----
+# encryption-pw and config are excluded by restic-backup.sh, which builds both
+# paths from $CONFIG_DIR and passes them to restic directly.
 #
-# Named file by file on purpose: $DUMP_DIR lives in the same directory and MUST
-# stay in the backup. Adjust these two paths if CONFIG_DIR is not the default.
-/root/.config/restic/encryption-pw
-/root/.config/restic/config
+# Do NOT add them here. A path written into this file is correct for exactly one
+# CONFIG_DIR, so on a host that sets a different one it matches nothing and the
+# encryption password goes into the repository that password unlocks -- a (/)
+# backup, no error, and nothing downstream that looks. Built from $CONFIG_DIR
+# they are right wherever it points.
+#
+# ($DUMP_DIR lives in the same directory and MUST stay in the backup, which is
+# why the script names the two files rather than the directory.)
 
 # ---- Live MySQL/MariaDB data: captured via consistent dumps instead ----
 /var/lib/mysql
@@ -77,8 +85,10 @@ __pycache__
 *.egg-info
 .ipynb_checkpoints
 # Virtualenvs: recreatable from requirements.txt / pyproject.
-# On PRODUCTION servers consider commenting these two out -- a restore that
-# already contains the venv is deterministic and works offline (no PyPI round-trip).
+# On PRODUCTION servers you usually want these back -- a restore that already
+# contains the venv is deterministic and works offline (no PyPI round-trip).
+# Do NOT comment them out here; put "!.venv" and "!venv" in that host's
+# excludes.local, or the next deploy undoes it.
 .venv
 venv
 
@@ -87,14 +97,16 @@ venv
 .composer/cache
 # Installed deps: recreatable from composer.lock.
 # Same caveat as the venvs -- on production, keeping vendor gives a runnable
-# restore with no "composer install" (network + correct PHP version) on the DR path.
+# restore with no "composer install" (network + correct PHP version) on the DR
+# path. Take it back with "!vendor" in that host's excludes.local.
 vendor
 
 # ---- .NET / NuGet ----
 # Global package cache (~/.nuget/packages); regenerable via "dotnet restore".
 # NOTE: the bulk of regenerable .NET output is per-project bin/ and obj/, which are
 # NOT excluded here -- bare "bin"/"obj" would also hit /bin, /usr/bin, node_modules/.bin,
-# etc. If you need them, anchor per host instead, e.g. /home/user/code/**/obj
+# etc. If you need them, anchor them per host in excludes.local, e.g.
+# /home/user/code/**/obj
 .nuget
 
 # ---- Docker (rootful; data-root /var/lib/docker) ----
@@ -113,5 +125,6 @@ vendor
 # KEPT on purpose: /var/lib/docker/volumes  (named volumes = persistent data).
 # Volumes holding databases you already dump are captured here too, but as a
 # live (torn) copy -- the dump is the consistent source of truth. You may exclude
-# specific DB volume paths if you want to avoid that redundant copy, e.g.:
+# specific DB volume paths if you want to avoid that redundant copy. That is a
+# per-host decision, so it belongs in excludes.local, e.g.:
 # /var/lib/docker/volumes/myapp_db

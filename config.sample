@@ -60,8 +60,16 @@ EXTRA_BACKUP_ARGS=(--one-file-system)
 UNBACKED_MOUNTS=()    # e.g. (/mnt/scratch /srv/media)
 
 # Exclude file (defaults to $CONFIG_DIR/excludes if unset). `excludes` has no
-# secrets and IS committed to the repo.
+# secrets, IS committed to the repo, and is OVERWRITTEN on every deploy -- it is
+# the fleet-wide base. Do not hand-edit it on a host.
 # EXCLUDE_FILE="$HOME/.config/restic/excludes"
+
+# This host's own patterns (defaults to $CONFIG_DIR/excludes.local if unset).
+# Hand-managed, never deployed, and OPTIONAL -- most hosts have none. It is read
+# AFTER the file above, so it can add patterns and also take one back with a
+# leading "!". That is where a per-host decision belongs: see
+# excludes.local.sample. Both files are passed to restic, in that order.
+# EXCLUDE_FILE_LOCAL="$HOME/.config/restic/excludes.local"
 
 # ---- Database dumps (declarative) -------------------------------------------
 # Declare databases here and the main script dumps them natively, before the

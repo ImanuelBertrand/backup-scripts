@@ -16,9 +16,21 @@ HOSTS=(
   laptop.lan
 )
 
-# Prepended when a HOSTS entry has no "user@". Root is required on the target:
-# deploy.sh writes to /usr/local/sbin and /etc/cron.d.
+# Prepended when a HOSTS entry has no "user@".
 SSH_USER="root"
+
+# deploy.sh needs root on the target: it writes /usr/local/sbin and /etc/cron.d,
+# and reads, hashes and diffs CONFIG_DIR under /root. When SSH_USER is not root,
+# every remote command is run through this prefix.
+#
+# It must be PASSWORDLESS. SSH_OPTS below uses BatchMode, so there is no
+# terminal on which to answer a prompt, and "sudo -n" fails immediately instead
+# of hanging -- which deploy.sh reports as a sudo failure, not an unreachable
+# host. On the target:
+#     echo 'imanuel ALL=(root) NOPASSWD: ALL' > /etc/sudoers.d/deploy-restic
+#     chmod 440 /etc/sudoers.d/deploy-restic
+# Where root logs in over ssh directly, this is ignored (nothing to elevate).
+SUDO="sudo -n"
 
 # BatchMode makes an unreachable or passphrase-prompting host fail fast instead
 # of hanging the whole run.

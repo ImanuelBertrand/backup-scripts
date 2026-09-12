@@ -403,7 +403,60 @@ declare -p BACKUP_PATHS &>/dev/null || preflight_fail "BACKUP_PATHS is not set i
 declare -p EXTRA_BACKUP_ARGS &>/dev/null || EXTRA_BACKUP_ARGS=()  # e.g. (--one-file-system)
 declare -p UNBACKED_MOUNTS   &>/dev/null || UNBACKED_MOUNTS=()    # mounts deliberately not backed up
 EXCLUDE_FILE="${EXCLUDE_FILE:-$CONFIG_DIR/excludes}"
+EXCLUDE_FILE_LOCAL="${EXCLUDE_FILE_LOCAL:-$CONFIG_DIR/excludes.local}"
 DUMP_DIR="${DUMP_DIR:-$CONFIG_DIR/db-dumps}"
+
+# ---- Exclude arguments ----
+# TWO files: the shared one deploy.sh pushes, then this host's own. The ORDER IS
+# LOAD-BEARING. restic lets a later pattern override an earlier one, so a host
+# keeps something the fleet-wide file drops by writing "!.venv" in excludes.local
+# -- and that only works while the local file comes SECOND. Reversed, the base
+# wins and the negation silently does nothing. (restic 0.18: a child can even be
+# rescued out of an excluded parent directory, unlike gitignore.)
+#
+# The local file is OPTIONAL and is passed ONLY when it is readable: restic exits
+# 1 on an --exclude-file it cannot open, so passing it unconditionally would fail
+# the backup on every host that has not written one -- which is all of them, the
+# hour this ships.
+declare -a EXCLUDE_ARGS=(--exclude-file "$EXCLUDE_FILE")
+[[ -r "$EXCLUDE_FILE_LOCAL" ]] && EXCLUDE_ARGS+=(--exclude-file "$EXCLUDE_FILE_LOCAL")
+
+# The two secrets are excluded here, built from $CONFIG_DIR, rather than written
+# as literal paths into `excludes`. A written-out path is correct for exactly one
+# CONFIG_DIR: on a host that sets a different one it matches nothing, and the
+# encryption password lands in the repository that password unlocks -- silently,
+# on an ordinary (/) backup, with no layer below that checks. Built here, the
+# pair is right wherever CONFIG_DIR points, and `excludes` stays a file about
+# regenerable junk that any host may edit freely.
+#
+# $DUMP_DIR sits in the same directory and MUST stay in the backup, which is why
+# these are two named files and not the directory.
+EXCLUDE_ARGS+=(--exclude "$CONFIG_DIR/encryption-pw" --exclude "$CONFIG_DIR/config")
+
+# ...and refuse to start if this host has re-included either of them. A "!"
+# pattern in an exclude FILE beats an --exclude on the command line, in either
+# order (checked against restic 0.18), so the two lines above are drift-proof
+# but not tamper-proof. The one case worth refusing outright is a host that
+# takes its own encryption password back into the backup: that puts the key
+# inside the repository the key unlocks, where it cannot help you and does hand
+# the rest-server credentials and the ntfy token to anyone holding a single
+# snapshot. Nothing downstream looks, and restore-time it is far too late.
+if [[ -r "$EXCLUDE_FILE_LOCAL" ]]; then
+  while IFS= read -r __line || [[ -n "$__line" ]]; do
+    [[ "$__line" == '!'* ]] || continue
+    __pat="${__line#!}"
+    __pat="${__pat%"${__pat##*[![:space:]]}"}"          # drop trailing blanks
+    if [[ "$__pat" == "$CONFIG_DIR/encryption-pw" || "$__pat" == "$CONFIG_DIR/config" ]]; then
+      preflight_fail \
+"$EXCLUDE_FILE_LOCAL re-includes $__pat with a \"!\" pattern.
+
+That writes this client's own secret into the repository it unlocks. Delete the
+line. If you genuinely need that file in a backup, it belongs in a different
+repository, not this one."
+    fi
+  done < "$EXCLUDE_FILE_LOCAL"
+  unset __line __pat
+fi
 LOCK_WAIT="${LOCK_WAIT:-15m}"
 SKIP_IF_METERED="${SKIP_IF_METERED:-false}"
 
@@ -804,8 +857,11 @@ one_file_system_in_use() {
 # worst a deliberately excluded mount is reported as a gap, which is a loud and
 # one-line-of-config fixable answer, not a silent one.
 excluded_prefixes() {
-  [[ -r "$EXCLUDE_FILE" ]] || return 0
-  grep -E '^/[^*?[]*$' "$EXCLUDE_FILE" 2>/dev/null | sed 's:/\+$::' || true
+  local f
+  for f in "$EXCLUDE_FILE" "$EXCLUDE_FILE_LOCAL"; do
+    [[ -r "$f" ]] || continue
+    grep -E '^/[^*?[]*$' "$f" 2>/dev/null | sed 's:/\+$::' || true
+  done
 }
 
 # PATH is deliberately closed (see the top of this file), so "restic is
@@ -1008,7 +1064,7 @@ $(printf '  %s\n' "${gap_labels[@]}")
 
 Each one is missing from every snapshot, with no error at restore time.
 Either add it to BACKUP_PATHS in $CONFIG_DIR/config, exclude it in
-$EXCLUDE_FILE, or -- if it really should not be backed up -- acknowledge it:
+$EXCLUDE_FILE_LOCAL, or -- if it really should not be backed up -- acknowledge it:
 
   UNBACKED_MOUNTS=($key)"
 
@@ -1388,7 +1444,7 @@ run_step "unlock" restic unlock
 run_step "backup" restic backup \
   --retry-lock "$LOCK_WAIT" \
   --exclude-caches \
-  --exclude-file "$EXCLUDE_FILE" \
+  "${EXCLUDE_ARGS[@]}" \
   ${EXTRA_BACKUP_ARGS+"${EXTRA_BACKUP_ARGS[@]}"} \
   "${BACKUP_PATHS[@]}"
 

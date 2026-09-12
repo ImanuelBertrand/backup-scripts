@@ -1,0 +1,42 @@
+# =============================================================================
+# excludes.local -- THIS host's exclude patterns  (SAMPLE / template)
+# -----------------------------------------------------------------------------
+#     cp excludes.local.sample /root/.config/restic/excludes.local   # then edit
+#
+# Hand-managed, per host, like `config`, `encryption-pw` and `pre-backup`.
+# deploy.sh NEVER touches it. The file is optional -- with no excludes.local at
+# all the host just gets the shared `excludes`, which is the normal case.
+#
+# Read AFTER the shared `excludes`, and that order is the whole point: a later
+# pattern beats an earlier one, so this file can both ADD exclusions and TAKE
+# BACK one the fleet-wide file made.
+#
+#   !!! Same comment rule as `excludes`: restic treats a line as a comment ONLY
+#   !!! when "#" is the FIRST character. An inline comment becomes part of the
+#   !!! pattern and then silently matches nothing.
+#
+# You cannot re-include the encryption password or config: restic-backup.sh
+# excludes those two from $CONFIG_DIR on the command line, by design.
+# =============================================================================
+
+# ---- Taking a shared exclusion BACK (prefix "!") ----------------------------
+# On a production host a restore that already contains the dependency tree is
+# deterministic and needs no network. The shared file excludes these; undo it
+# here, for this host only:
+# !.venv
+# !venv
+# !vendor
+
+# ---- Extra paths only this host has ----------------------------------------
+# Anchored at the backup root (BACKUP_PATHS=(/) => the real absolute path).
+# /srv/scratch
+# /var/lib/myapp/cache
+
+# ---- .NET build output, anchored so bare "obj" cannot hit /usr/bin etc. -----
+# /home/user/code/**/obj
+# /home/user/code/**/bin
+
+# ---- A DB volume you already capture as a consistent dump ------------------
+# The live copy under /var/lib/docker/volumes is torn; the dump is the source of
+# truth, so the redundant copy can go:
+# /var/lib/docker/volumes/myapp_db

@@ -10,7 +10,8 @@ from several machines (servers and a laptop) into one central **append-only**
  restic-backup.sh  ──── restic ───────────────────────────────>    rest-server :8000
    config          (rest:http://10.0.0.2:8000/<user>/)             --append-only
    excludes                                                        --private-repos
-   pre-backup (optional hook)                                      /data/<user>/
+   excludes.local (optional, per host)                             /data/<user>/
+   pre-backup (optional hook)
                                                                           │
  ntfy + healthchecks  <──── normal internet ────                   maintenance cron
  (alerts still work when the tunnel is down)                       forget / prune / check
@@ -34,7 +35,8 @@ backup**, not the reason for the skip.
 |---|---|---|
 | `restic-backup.sh` | client, e.g. `/usr/local/sbin/` | The entire client. DB dumps → `restic backup`. |
 | `config.sample` | client, → `~/.config/restic/config` | Per-host settings **and secrets**. Never commit the filled-in copy. |
-| `excludes` | client, → `~/.config/restic/excludes` | Shared exclude patterns. No secrets; committed. |
+| `excludes` | client, → `~/.config/restic/excludes` | Fleet-wide exclude patterns. No secrets; committed. **Overwritten by every deploy** — never hand-edit on a host. |
+| `excludes.local.sample` | client, → `~/.config/restic/excludes.local` | **Optional**, per host, hand-managed. Read *after* `excludes`, so it adds patterns or takes one back with `!`. |
 | `pre-backup` | client, → `~/.config/restic/pre-backup` | **Optional** hook for what the config can't express. Omit if unneeded. |
 | `restic-backup.cron` | client, → `/etc/cron.d/restic-backup` | Hourly invocation. The **script** decides when to actually run. |
 | `deploy.sh` | admin machine (stays in the repo) | Pushes the files above to every host. Clients never pull. |
@@ -187,6 +189,8 @@ install -m 755 restic-backup.sh /usr/local/sbin/restic-backup.sh
 
 install -d -m 700 /root/.config/restic
 install -m 644 excludes /root/.config/restic/excludes
+# optional, only if this host needs its own patterns:
+# install -m 644 excludes.local.sample /root/.config/restic/excludes.local
 install -m 600 config.sample /root/.config/restic/config
 ```
 
@@ -214,14 +218,18 @@ between — and permanently so if only the first line gets pasted.)
 > permanently unreadable. There is no recovery path. The maintenance host also
 > needs a copy (see §6).
 
-`encryption-pw` and `config` are in the exclude file, so a `(/)` backup does not
-contain them. A password inside the repository it unlocks cannot help you — you
+`encryption-pw` and `config` are excluded by `restic-backup.sh` itself, derived
+from `CONFIG_DIR`, so a `(/)` backup does not contain them. A password inside the repository it unlocks cannot help you — you
 need it to read the snapshot in the first place — while it does mean that one
 leaked client password yields that host's rest-server credentials and ntfy token
 as well, and that every retired password stays readable for as long as an old
 snapshot survives. `$DUMP_DIR` sits in the same directory and *is* backed up;
-the two files are named individually for that reason. If you move `CONFIG_DIR`,
-move these two lines with it.
+the two files are named individually for that reason. Building the paths from
+`CONFIG_DIR` keeps them correct wherever it points — a literal path in
+`excludes` would be right for one `CONFIG_DIR` only, and on a host that set a
+different one the password would go into the repository it unlocks, silently.
+Neither `excludes` nor `excludes.local` can drop them, and re-including either
+with a `!` pattern is refused at preflight.
 
 ### 3.3 Edit the config
 
@@ -706,11 +714,38 @@ $EDITOR deploy.conf
 
 It deploys `restic-backup.sh`, `excludes`, and the cron entry — rendering the
 latter with **that host's own minute** from `CRON_MINUTE`, which is the easiest
-way to keep the fleet staggered. It never touches `config`, `encryption-pw`, or
-`pre-backup`: those are per-host, hand-managed, and two of them are secrets.
+way to keep the fleet staggered. It never touches `config`, `encryption-pw`,
+`pre-backup`, or `excludes.local`: those are per-host and hand-managed, and two
+of them are secrets.
+
+`excludes` is the fleet-wide base and is **overwritten in place**, so anything
+you hand-edit onto a target is reverted by the next deploy — with no error, the
+only symptom being a snapshot that quietly stopped containing something. Put
+per-host patterns in `excludes.local` instead. restic reads it after `excludes`,
+and a later pattern beats an earlier one, so that file can add exclusions *and*
+take one back: `!.venv` there re-includes what the shared file drops. A host
+with no `excludes.local` is the normal case — the flag is passed only when the
+file exists.
 
 Two details worth knowing:
 
+- **It needs root on the target, and gets it through `sudo`.** It writes
+  `/usr/local/sbin` and `/etc/cron.d`, and it reads, hashes and diffs
+  `CONFIG_DIR` under `/root` — so the elevation is on every remote command, not
+  just the writes. Set `SSH_USER` to the account you actually log in as; every
+  command is then prefixed with `SUDO` (default `sudo -n`), which must be
+  **passwordless**, since `SSH_OPTS` uses `BatchMode` and there is no terminal
+  to answer a prompt on:
+
+  ```bash
+  # on each target, once
+  echo 'youruser ALL=(root) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/deploy-restic
+  sudo chmod 440 /etc/sudoers.d/deploy-restic
+  ```
+
+  Where root logs in over ssh directly, leave `SSH_USER="root"` and the prefix
+  drops out on its own. A refused `sudo` is reported as a sudo failure with the
+  message the host gave, not as an unreachable host.
 - **It installs by rename, not by copy.** `restic-backup.sh` may be running when
   you deploy, and bash reads its own source incrementally as it executes —
   overwriting it in place makes a live run execute whatever happens to land at

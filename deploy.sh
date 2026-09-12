@@ -12,14 +12,28 @@ set -euo pipefail
 #
 # What it deploys:   restic-backup.sh, excludes, and (per host, with that host's
 #                    own minute) the /etc/cron.d entry.
+#                    `excludes` is the FLEET-WIDE base and is overwritten in
+#                    place, so a hand-edit on a target is reverted by the next
+#                    deploy -- silently, the symptom being a snapshot that
+#                    quietly stopped containing something.
 # What it NEVER touches:
 #                    config and encryption-pw  -- secrets, per host, hand-managed
 #                    pre-backup                -- per-host hook, hand-managed
+#                    excludes.local            -- this host's own patterns, read
+#                                                 after `excludes` so it can add
+#                                                 to it or take a pattern back
+#
+# How it connects:   ssh as $SSH_USER (deploy.conf), then runs every remote
+#                    command that needs root through $SUDO -- default "sudo -n",
+#                    which must be passwordless: BatchMode ssh cannot answer a
+#                    password prompt. Where root logs in directly, set
+#                    SSH_USER="root" and the sudo prefix drops out on its own.
 #
 #   ./deploy.sh                 plan, show diffs, ask, then apply
 #   ./deploy.sh --check         report each host's --status; alerts nobody
 #   ./deploy.sh --dry-run       plan and diff only
 #   DIFF_LINES=0 ./deploy.sh    show every diff line (default: first 60 per file)
+#   NO_COLOR=1 ./deploy.sh      plain diffs (colour is on only for a terminal)
 #   ./deploy.sh --host srv01    just that host (repeatable)
 #   ./deploy.sh --yes           skip the confirmation prompt; required when
 #                               stdin is not a terminal (cron, CI)
@@ -52,6 +66,7 @@ done
 [[ -f "$CONF" ]] || { echo "FATAL: no $CONF (copy deploy.conf.sample and edit it)" >&2; exit 1; }
 declare -A CRON_MINUTE=()
 SSH_USER="root"
+SUDO="sudo -n"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 SBIN_PATH="/usr/local/sbin/restic-backup.sh"
 CONFIG_DIR="/root/.config/restic"
@@ -128,6 +143,17 @@ fi
 addr_of() { [[ "$1" == *@* ]] && printf '%s' "$1" || printf '%s@%s' "$SSH_USER" "$1"; }
 sha_of()  { sha256sum "$1" | awk '{print $1}'; }
 
+# The prefix for every remote command, with its trailing space: $SUDO unless the
+# login is already root. EVERY path this tool touches is root-only -- it writes
+# /usr/local/sbin and /etc/cron.d, and it reads, hashes and diffs $CONFIG_DIR
+# under /root -- so this is not confined to the pushes. Left off the reads, the
+# hashes come back empty, every file looks changed, and the run re-pushes the
+# whole fleet on every invocation before failing on the first write.
+sudo_for() {                           # sudo_for <user@host>
+  [[ "${1%%@*}" == root ]] && return 0
+  printf '%s ' "$SUDO"
+}
+
 # Single-quote a value for the remote shell. Everything here crosses an ssh
 # command line, which means it is expanded TWICE -- once locally, once by the
 # remote shell -- and the paths come from deploy.conf, which is sourced as bash
@@ -174,13 +200,19 @@ prereq_list() {                        # prereq_list <probe output>
   awk '/^#PRE /{ sub(/^#PRE /, ""); out = (out ? out ", " : "") $0 } END { print out }' <<<"$1"
 }
 
-prereq_probe() {
+# Probed AS ROOT, via $1 (the sudo_for prefix). The question is never what the
+# login user can see -- it is whether the hourly root cron job will work, and the
+# two files live under /root, where an unprivileged probe reports "no config" on
+# a perfectly healthy host. PATH differs between the two users as well, so the
+# command lookups go through root's shell too.
+prereq_probe() {                       # prereq_probe <sudo-prefix>
+  local S="$1"
   cat <<EOF
-command -v restic >/dev/null 2>&1 || echo '#PRE restic is not installed'
-command -v flock  >/dev/null 2>&1 || echo '#PRE flock is missing (util-linux)'
-command -v curl   >/dev/null 2>&1 || echo '#PRE curl is missing (health check, ntfy, dead-mans switch)'
-[ -f $(rq "$CONFIG_DIR/config") ]        || echo '#PRE no config'
-[ -r $(rq "$CONFIG_DIR/encryption-pw") ] || echo '#PRE no encryption-pw'
+${S}sh -c 'command -v restic >/dev/null 2>&1' || echo '#PRE restic is not installed'
+${S}sh -c 'command -v flock  >/dev/null 2>&1' || echo '#PRE flock is missing (util-linux)'
+${S}sh -c 'command -v curl   >/dev/null 2>&1' || echo '#PRE curl is missing (health check, ntfy, dead-mans switch)'
+${S}test -f $(rq "$CONFIG_DIR/config")        || echo '#PRE no config'
+${S}test -r $(rq "$CONFIG_DIR/encryption-pw") || echo '#PRE no encryption-pw'
 EOF
 }
 
@@ -206,8 +238,9 @@ if (( CHECK_ONLY )); then
     # either) right up until MAX_BACKUP_AGE_HOURS elapsed, hours later.
     #
     # Same round trip, and --status runs LAST so $? is still its own exit code.
-    out=$(ssh -n "${SSH_OPTS[@]}" "$(addr_of "$h")" "$(prereq_probe)
-         RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" 2>&1) && s=0 || s=$?
+    S="$(sudo_for "$(addr_of "$h")")"
+    out=$(ssh -n "${SSH_OPTS[@]}" "$(addr_of "$h")" "$(prereq_probe "$S")
+         ${S}env RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" 2>&1) && s=0 || s=$?
     prereq="$(prereq_list "$out")"
     [[ -n "$prereq" ]] && PREREQ[$h]="$prereq"
     sed '/^#PRE /d' <<<"$out"
@@ -217,7 +250,7 @@ if (( CHECK_ONLY )); then
     case "$s" in
       0) ;;
       3) echo "  STALE: no successful backup within MAX_BACKUP_AGE_HOURS"; rc=1 ;;
-      *) echo "  no status: unreachable, not installed, or no config"; rc=1 ;;
+      *) echo "  no status: unreachable, sudo refused, not installed, or no config"; rc=1 ;;
     esac
   done
   warn_no_cron
@@ -240,11 +273,12 @@ fi
 # ---- pass 1: plan ----
 local_sh="$(sha_of "$SRC_DIR/restic-backup.sh")"
 local_ex="$(sha_of "$SRC_DIR/excludes")"
-declare -A PLAN=() CRONTMP=()
+declare -A PLAN=() CRONTMP=() WHY=() SHORT=()
 pending=0; unreachable=(); CURRENT_HOST=""
+ERRTMP="$(mktemp)"
 # The four hand-written cleanup loops this replaces all missed the "Not a
 # terminal; re-run with --yes" exit, and any abort from set -e or Ctrl-C.
-cleanup_tmp() { rm -f ${CRONTMP[@]+"${CRONTMP[@]}"}; }
+cleanup_tmp() { rm -f "$ERRTMP" ${CRONTMP[@]+"${CRONTMP[@]}"}; }
 trap cleanup_tmp EXIT
 # An interrupt between two pushes leaves a host half-deployed, and nothing
 # records which one. Say so rather than leaving it to be discovered.
@@ -260,11 +294,26 @@ for h in "${HOSTS[@]}"; do
   # a push -- a first deploy legitimately precedes the hand-managed config -- but
   # every one of them is a host that installs cleanly and then never backs up,
   # which is the failure this tool is least able to notice afterwards.
+  # Keep ssh's own stderr. Discarding it turned every distinct failure -- a
+  # refused root login, an unknown host key, a DNS miss -- into the single word
+  # "unreachable", which sends you off testing `ssh <host>` by hand as yourself
+  # and finding it works: deploy connects as $SSH_USER, not as you.
+  : > "$ERRTMP"
+  S="$(sudo_for "$addr")"
+  # The sudo check is its own statement, before anything whose stderr is
+  # discarded. A failing `sudo -n` inside the sha256sum line would be swallowed
+  # by that 2>/dev/null and read as "all three files are missing", which is
+  # indistinguishable from a fresh host -- so the run would cheerfully plan a
+  # full push and only discover the truth while writing.
   remote="$(ssh -n "${SSH_OPTS[@]}" "$addr" "
-      sha256sum $(rq "$SBIN_PATH") $(rq "$CONFIG_DIR/excludes") $(rq "$CRON_PATH") 2>/dev/null
-$(prereq_probe)
-      true" 2>/dev/null)" || {
-    unreachable+=("$h"); PLAN[$h]="unreachable"; continue; }
+      ${S}true || exit 111
+      ${S}sha256sum $(rq "$SBIN_PATH") $(rq "$CONFIG_DIR/excludes") $(rq "$CRON_PATH") 2>/dev/null
+$(prereq_probe "$S")
+      true" 2>"$ERRTMP")" || {
+    unreachable+=("$h"); PLAN[$h]="unreachable"
+    WHY[$h]="$(grep -v '^$' "$ERRTMP" | tail -n1)"
+    [[ "${WHY[$h]}" == sudo:* ]] && SHORT[$h]="sudo failed"
+    continue; }
   prereq="$(prereq_list "$remote")"
   [[ -n "$prereq" ]] && PREREQ[$h]="$prereq"
   r_sh=$(remote_sha "$remote" "$SBIN_PATH")
@@ -288,9 +337,22 @@ printf '\n%-22s %s\n' "HOST" "TO UPDATE"
 for h in "${HOSTS[@]}"; do
   note=""
   [[ "${PLAN[$h]}" == unreachable || -n "${CRON_MINUTE[$h]:-}" ]] || note="   << no CRON_MINUTE"
-  printf '%-22s %s%s\n' "$h" "${PLAN[$h]:-up to date}" "$note"
+  printf '%-22s %s%s\n' "$h" "${SHORT[$h]:-${PLAN[$h]:-up to date}}" "$note"
 done
-(( ${#unreachable[@]} )) && printf '\n%d host(s) unreachable: %s\n' "${#unreachable[@]}" "${unreachable[*]}"
+if (( ${#unreachable[@]} )); then
+  printf '\n%d host(s) could not be planned: %s\n' "${#unreachable[@]}" "${unreachable[*]}"
+  for h in "${unreachable[@]}"; do
+    printf '  %-20s %s\n' "$h" "${WHY[$h]:-ssh failed without a message}"
+  done
+  printf '  Deploy connects as %s@ and runs as root through "%s" -- test both:\n' \
+    "$SSH_USER" "$SUDO"
+  printf '    ssh %s %s %s true\n' \
+    "${SSH_OPTS[*]}" "$(addr_of "${unreachable[0]}")" "$SUDO"
+  if grep -qi '^sudo:' <<<"${WHY[*]}"; then
+    printf '  That is a sudo failure, not a connection failure. Passwordless sudo is\n'
+    printf '  required: BatchMode ssh has no terminal to answer a password prompt on.\n'
+  fi
+fi
 warn_no_cron
 warn_prereqs
 
@@ -309,11 +371,46 @@ fi
 # both replaced sight unseen.
 DIFF_LINES="${DIFF_LINES:-60}"         # per file; 0 = no limit
 
+# The diff is also this run's record -- --yes suppresses the question, not the
+# record -- so colour is decoration and must never be what makes it readable.
+# On for a terminal only, and off for NO_COLOR (no-color.org), a dumb TERM, and
+# any redirection into a file or a CI log, where the escapes would be noise in
+# the one artefact left behind.
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
+  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_CYA=$'\033[36m'; C_BLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_RED=""; C_GRN=""; C_CYA=""; C_BLD=""; C_OFF=""
+fi
+
+# NOT `diff --color=always`: that is GNU diffutils >= 3.4, and this half of the
+# tool runs on whatever machine the operator is sitting at. Everywhere else the
+# unknown option makes diff exit 2 having printed nothing, and diff_one reads an
+# empty output as "identical -- forced push" -- so the unsupported flag would
+# not lose the colour, it would lose the diff, on exactly the pass whose whole
+# purpose is showing a human what is about to run as root on every host.
+#
+# Every line carries its own reset, so truncating at DIFF_LINES cannot leave a
+# colour bleeding into the rest of the run. The escapes cross `awk -v` intact
+# because they are literal ESC characters with no backslash left for awk to
+# reinterpret -- the hazard render_cron's -v values do have.
+#
+# Ordered: ---/+++ are the file headers, not a removal and an addition.
+colorize_diff() {
+  [[ -n "$C_OFF" ]] || { cat; return 0; }
+  awk -v r="$C_RED" -v g="$C_GRN" -v c="$C_CYA" -v b="$C_BLD" -v o="$C_OFF" '
+    /^(---|\+\+\+)/ { print b $0 o; next }
+    /^@@/            { print c $0 o; next }
+    /^\+/            { print g $0 o; next }
+    /^-/             { print r $0 o; next }
+                     { print }
+  '
+}
+
 diff_one() {                           # diff_one <addr> <host> <remote-path> <local-file> [label]
   local addr="$1" host="$2" remote="$3" src="$4" label="${5:-local:$(basename "$4")}" out n
-  out="$(ssh -n "${SSH_OPTS[@]}" "$addr" "cat $(rq "$remote") 2>/dev/null" \
-         | diff -u --label "$host:$remote" --label "$label" - "$src" || true)"
-  printf '\n--- %s: %s ---\n' "$host" "$remote"
+  out="$(ssh -n "${SSH_OPTS[@]}" "$addr" "$(sudo_for "$addr")cat $(rq "$remote") 2>/dev/null" \
+         | diff -u --label "$host:$remote" --label "$label" - "$src" | colorize_diff || true)"
+  printf '\n%s--- %s: %s ---%s\n' "$C_BLD" "$host" "$remote" "$C_OFF"
   if [[ -z "$out" ]]; then
     printf '  (identical -- forced push)\n'
     return 0
@@ -378,16 +475,24 @@ fi
 # `install` copy back through it into /usr/local/sbin/restic-backup.sh -- which
 # is to say, choose the contents of an hourly root cron job. /tmp being sticky
 # does not help when the name does not exist yet.
+# `tee`, not `cat >`: with an unprivileged login the redirection is performed by
+# the login shell, so `sudo cat > "$dest.new"` opens the staging file as the
+# LOGIN user in a root-owned directory -- permission denied, and where the
+# directory happens to be writable, a file root then renames into place that the
+# login user owned for the length of the push. Only the writing process may be
+# the privileged one. The umask above still applies: sudo takes the union of the
+# caller's umask and its own, so the staged file is created 600 either way.
 push() {                               # push <local> <remote-dest> <mode> [dir-mode]
-  local src="$1" dest="$2" mode="$3" dirmode="${4:-755}"
+  local src="$1" dest="$2" mode="$3" dirmode="${4:-755}" S
+  S="$(sudo_for "$addr")"
   ssh "${SSH_OPTS[@]}" "$addr" "
     set -eu
     dest=$(rq "$dest"); dir=\$(dirname \"\$dest\")
-    [ -d \"\$dir\" ] || install -d -m $(rq "$dirmode") \"\$dir\"
+    [ -d \"\$dir\" ] || ${S}install -d -m $(rq "$dirmode") \"\$dir\"
     umask 077
-    cat > \"\$dest.new\"
-    chmod $(rq "$mode") \"\$dest.new\"
-    mv -f \"\$dest.new\" \"\$dest\"
+    ${S}tee \"\$dest.new\" >/dev/null
+    ${S}chmod $(rq "$mode") \"\$dest.new\"
+    ${S}mv -f \"\$dest.new\" \"\$dest\"
   " < "$src"
 }
 
@@ -421,7 +526,7 @@ for h in "${HOSTS[@]}"; do
   fi
   if (( ok )); then
     ssh -n "${SSH_OPTS[@]}" "$addr" \
-        "RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" \
+        "$(sudo_for "$addr")env RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" \
       || { echo "  (--status failed)"; rc=1; }
   else
     rc=1
