@@ -502,7 +502,20 @@ version_check() {                      # $1 = "force" to ignore the interval
   log "WARN: this host is NOT running the published version of restic-backup.sh"
   log "WARN:   local  ${local_sha:0:12}   remote ${remote_sha:0:12}   ($VERSION_CHECK_URL)"
   log "WARN:   deploy with ./deploy.sh -- this host will not update itself"
-  if [[ -n "$NTFY_TOPIC_LOW" && "$remote_sha" != "$notified_sha" ]]; then
+  # The REPORT_ONLY guard belongs here and not only inside ntfy(): what marks a
+  # drift as notified is the write_state below, which sits NEXT TO the send
+  # rather than inside it. Without this, `--check-update` reached an inert ntfy
+  # and then recorded the drift as already announced, so the next real run --
+  # the one that would actually have pushed -- stayed silent. That is the same
+  # "diagnostic run spends the alert" failure the argument parsing guards
+  # against for the urgent path, in the one place it does not inherit it.
+  #
+  # The cache write above still happens, deliberately: --check-update was asked
+  # to go and look, so recording what it found is its job, and it leaves
+  # notified_sha alone. The only cost is that it also refreshes `checked`, so a
+  # real run inside VERSION_CHECK_INTERVAL_HOURS skips the re-check and the
+  # push arrives with the next one -- delayed, not dropped.
+  if [[ -n "$NTFY_TOPIC_LOW" && "$remote_sha" != "$notified_sha" ]] && (( ! REPORT_ONLY )); then
     ntfy "$NTFY_TOPIC_LOW" low arrows_counterclockwise \
       "Backup script out of date on $(hostname)" \
 "Host:   $(hostname)
