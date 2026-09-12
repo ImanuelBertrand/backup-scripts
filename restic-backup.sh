@@ -22,24 +22,57 @@ set -euo pipefail
 # disturb a live maintenance prune.
 #
 # ---------------------------------------------------------------------------
-# SKIPPING IS SILENT; AGE IS WHAT ALERTS. Every path that declines to back up
-# (metered link, tunnel down, lock held) exits through stale_exit(), which pages
-# you once the last SUCCESSFUL backup is older than MAX_BACKUP_AGE_HOURS=36. A
-# host that quietly stops backing up therefore alerts LOCALLY, instead of relying
-# on the external dead-man's switch to notice eventually. That is what makes a
-# silent skip safe: it can no longer hide.
+# SELF-SCHEDULING. Cron invokes this HOURLY; the script decides whether this
+# particular hour is the moment to run. Three numbers do it (all in the config):
 #
-# $CONFIG_DIR/.last-success is written ONLY after `restic backup` returns 0, and
-# is the sole record of when a backup last worked.
+#   BACKUP_WINDOW=23-06       run in this local-hour window, ...
+#   MIN_INTERVAL_HOURS=20     ... but not if a run succeeded this recently, ...
+#   FORCE_AFTER_HOURS=24      ... and ignore the window entirely past this age.
 #
-# Notifications are throttled to match: only the first failure after a success,
-# and the crossing of MAX_BACKUP_AGE, page you (see notify_failure).
+# Plain cron does NOT replay jobs missed while a machine was off or asleep (no
+# anacron, no systemd Persistent=). FORCE_AFTER_HOURS *is* the catch-up: a
+# laptop that is never awake during the window still backs up once a day, at
+# whatever hour it happens to be running. That makes $CONFIG_DIR/.last-success
+# load-bearing -- it is the only record of when a backup last worked.
+#
+# MAX_BACKUP_AGE_HOURS=36 is the hard fail. Every path that declines to back up
+# (not due, metered, tunnel down, lock held) exits through stale_exit(), so a
+# host that quietly stops backing up alerts LOCALLY instead of relying on the
+# external dead-man's switch. This is what makes a skip safe: it can no longer
+# hide. A transient failure inside the window is logged and retried next hour;
+# only the first failure after a success, and the crossing of MAX_BACKUP_AGE,
+# page you (see notify_failure) -- 24 invocations a day must not mean 24 pushes.
+#
+# Run by hand with --force (bypass every gate) or --status (print the decision
+# and change nothing).
 # ---------------------------------------------------------------------------
 #
 # Requires restic >= 0.16 (--retry-lock). Keep client restic <= maintenance host.
 # ============================================================================
 
 export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+
+# ---- Arguments ----
+FORCE="${FORCE:-0}"
+STATUS_ONLY=0
+usage() {
+  cat <<'USAGE'
+Usage: restic-backup.sh [--force] [--status]
+
+  --force    back up now, ignoring the window / min-interval / metered gates
+             (the reachability gate still applies -- there is nowhere to push)
+  --status   print the scheduling decision and exit; changes nothing
+USAGE
+}
+while (( $# )); do
+  case "$1" in
+    -f|--force)  FORCE=1 ;;
+    -s|--status) STATUS_ONLY=1 ;;
+    -h|--help)   usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
 
 # ---- Small helpers (needed while validating the config) ----
 log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*"; }
@@ -77,7 +110,10 @@ DUMP_DIR="${DUMP_DIR:-$CONFIG_DIR/db-dumps}"
 LOCK_WAIT="${LOCK_WAIT:-15m}"
 SKIP_IF_METERED="${SKIP_IF_METERED:-false}"
 
-# Staleness. Hours; 0 disables the rule.
+# Scheduling / staleness. Hours; 0 disables that particular rule.
+BACKUP_WINDOW="${BACKUP_WINDOW:-23-06}"              # "" = no window
+MIN_INTERVAL_HOURS="${MIN_INTERVAL_HOURS:-20}"
+FORCE_AFTER_HOURS="${FORCE_AFTER_HOURS:-24}"
 MAX_BACKUP_AGE_HOURS="${MAX_BACKUP_AGE_HOURS:-36}"   # 0 = never hard-fail on age
 NOTIFY_REPEAT_HOURS="${NOTIFY_REPEAT_HOURS:-12}"     # re-page interval while stale
 
@@ -92,17 +128,26 @@ if declare -p SKIP_IF_UNREACHABLE &>/dev/null; then
   log "WARN: becomes a failure. Delete it from $CONFIG_DIR/config."
 fi
 
-for _v in MAX_BACKUP_AGE_HOURS NOTIFY_REPEAT_HOURS WG_SETTLE_SECS; do
+for _v in MIN_INTERVAL_HOURS FORCE_AFTER_HOURS MAX_BACKUP_AGE_HOURS NOTIFY_REPEAT_HOURS WG_SETTLE_SECS; do
   declare -n _r="$_v"
   if [[ ! "$_r" =~ ^[0-9]+$ ]]; then log "WARN: $_v='$_r' is not an integer; using 0"; _r=0; fi
 done
 unset -n _r; unset _v
 
+MIN_INTERVAL_SEC=$(( MIN_INTERVAL_HOURS * 3600 ))
+FORCE_AFTER_SEC=$(( FORCE_AFTER_HOURS * 3600 ))
 MAX_AGE_SEC=$(( MAX_BACKUP_AGE_HOURS * 3600 ))
 NOTIFY_REPEAT_SEC=$(( NOTIFY_REPEAT_HOURS * 3600 ))
 
+# The hard-fail threshold must sit ABOVE the catch-up threshold, or the script
+# pages you about a backup it was never going to attempt yet.
+if (( MAX_AGE_SEC > 0 && FORCE_AFTER_SEC > 0 && MAX_AGE_SEC <= FORCE_AFTER_SEC )); then
+  log "WARN: MAX_BACKUP_AGE_HOURS ($MAX_BACKUP_AGE_HOURS) <= FORCE_AFTER_HOURS ($FORCE_AFTER_HOURS);"
+  log "WARN: expect alerts for backups that are not yet due. Raise MAX_BACKUP_AGE_HOURS."
+fi
+
 # State. Cheap, local, and the only thing that survives a reboot: .last-success
-# is what every staleness decision is measured against.
+# is what every scheduling and staleness decision is measured against.
 LAST_SUCCESS_FILE="$CONFIG_DIR/.last-success"
 FIRST_SEEN_FILE="$CONFIG_DIR/.first-seen"
 NOTIFY_STATE_FILE="$CONFIG_DIR/.notify-state"
@@ -316,11 +361,15 @@ _have_db_config() {
 }
 
 # ============================================================================
-#  AGE OF THE LAST SUCCESSFUL BACKUP
+#  SCHEDULING GATE  --  "is this hour the moment?"
 #
-#  ALERT_AGE_SEC is measured from .first-seen when there has never been a
-#  success -- otherwise a host installed this morning would page you as "36h
-#  stale" on day one.
+#  Two different ages, deliberately:
+#    SCHED_AGE_SEC  time since the last SUCCESS; -1 ("never") means always due,
+#                   so a fresh install backs up immediately instead of waiting
+#                   for tonight's window.
+#    ALERT_AGE_SEC  the same, but measured from .first-seen when there has never
+#                   been a success -- otherwise a host installed this morning
+#                   would page you as "36h stale" on day one.
 # ============================================================================
 NOW=$(date +%s)
 LAST_SUCCESS=$(read_epoch "$LAST_SUCCESS_FILE")
@@ -328,15 +377,36 @@ FIRST_SEEN=$(read_epoch "$FIRST_SEEN_FILE")
 (( FIRST_SEEN > 0 )) || FIRST_SEEN=$NOW
 
 if (( LAST_SUCCESS > 0 )); then
-  ALERT_AGE_SEC=$(( NOW - LAST_SUCCESS ))
-  if (( ALERT_AGE_SEC < 0 )); then
+  SCHED_AGE_SEC=$(( NOW - LAST_SUCCESS ))
+  if (( SCHED_AGE_SEC < 0 )); then
     log "WARN: .last-success lies in the future (clock skew?); treating as just-run."
-    ALERT_AGE_SEC=0
+    SCHED_AGE_SEC=0
   fi
+  ALERT_AGE_SEC=$SCHED_AGE_SEC
 else
+  SCHED_AGE_SEC=-1
   ALERT_AGE_SEC=$(( NOW - FIRST_SEEN ))
   if (( ALERT_AGE_SEC < 0 )); then ALERT_AGE_SEC=0; fi
 fi
+
+# NOTE: called inside a command substitution by --status, so every diagnostic
+# in here goes to stderr -- on stdout it would be captured as part of the value.
+in_backup_window() {
+  [[ -n "$BACKUP_WINDOW" ]] || return 0
+  if [[ ! "$BACKUP_WINDOW" =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]]; then
+    log "WARN: BACKUP_WINDOW='$BACKUP_WINDOW' is malformed; ignoring the window." >&2
+    return 0
+  fi
+  local s e h
+  s=$(( 10#${BASH_REMATCH[1]} )); e=$(( 10#${BASH_REMATCH[2]} ))
+  if (( s > 23 || e > 23 )); then
+    log "WARN: BACKUP_WINDOW='$BACKUP_WINDOW' is out of range; ignoring the window." >&2
+    return 0
+  fi
+  (( s == e )) && return 0                       # 0-0 etc. = always
+  h=$(( 10#$(date '+%H') ))
+  if (( s < e )); then (( h >= s && h < e )); else (( h >= s || h < e )); fi   # wraps midnight
+}
 
 # Every exit path that did NOT back up comes through here, so that a host which
 # quietly stops backing up still alerts -- locally, without waiting on the
@@ -353,8 +423,36 @@ This run did not back up: $reason"
   exit 0
 }
 
+DUE_REASON=""
+if (( FORCE )); then
+  DUE_REASON="forced (--force)"
+elif (( SCHED_AGE_SEC < 0 )); then
+  DUE_REASON="no successful backup on record"
+elif (( FORCE_AFTER_SEC > 0 && SCHED_AGE_SEC >= FORCE_AFTER_SEC )); then
+  DUE_REASON="catch-up: last success $(fmt_age "$SCHED_AGE_SEC") ago (>= ${FORCE_AFTER_HOURS}h)"
+elif (( SCHED_AGE_SEC >= MIN_INTERVAL_SEC )) && in_backup_window; then
+  DUE_REASON="in window ${BACKUP_WINDOW:-any}, last success $(fmt_age "$SCHED_AGE_SEC") ago"
+fi
+
+if (( STATUS_ONLY )); then
+  if (( LAST_SUCCESS > 0 )); then
+    printf 'last success : %s (%s ago)\n' "$(date -d "@$LAST_SUCCESS" '+%Y-%m-%d %H:%M:%S')" "$(fmt_age "$SCHED_AGE_SEC")"
+  else
+    printf 'last success : never (first seen %s, %s ago)\n' "$(date -d "@$FIRST_SEEN" '+%Y-%m-%d %H:%M:%S')" "$(fmt_age "$ALERT_AGE_SEC")"
+  fi
+  printf 'window       : %s  (now %s -> %s)\n' "${BACKUP_WINDOW:-none}" "$(date '+%H:%M')" \
+    "$(in_backup_window && echo inside || echo outside)"
+  printf 'thresholds   : min-interval %sh, catch-up %sh, hard-fail %sh\n' \
+    "$MIN_INTERVAL_HOURS" "$FORCE_AFTER_HOURS" "$MAX_BACKUP_AGE_HOURS"
+  printf 'stale        : %s\n' \
+    "$( (( MAX_AGE_SEC > 0 && ALERT_AGE_SEC >= MAX_AGE_SEC )) && echo 'YES -- would alert' || echo no )"
+  printf 'decision     : %s\n' "${DUE_REASON:-not due, would skip}"
+  exit 0
+fi
+
 # ---- Single-instance lock ----
-# The newcomer exits quietly -- but still through stale_exit, so a run wedged for
+# A backup that runs longer than an hour meets the next invocation head-on. The
+# newcomer exits quietly -- but still through stale_exit, so a run wedged for
 # days is not mistaken for a healthy host.
 if command -v flock >/dev/null 2>&1; then
   exec 9>"$CONFIG_DIR/.lock"
@@ -362,6 +460,12 @@ if command -v flock >/dev/null 2>&1; then
 fi
 
 if [[ ! -s "$FIRST_SEEN_FILE" ]]; then printf '%s\n' "$FIRST_SEEN" > "$FIRST_SEEN_FILE"; fi
+
+if [[ -z "$DUE_REASON" ]]; then
+  log "Not due (last success $(fmt_age "$SCHED_AGE_SEC") ago, window ${BACKUP_WINDOW:-any}); exiting."
+  stale_exit "not due yet"
+fi
+log "Due: $DUE_REASON"
 
 # ---- Network gate ----
 # Only knob left: skip metered links (cellular cost). Reachability of 10.0.0.2
@@ -373,7 +477,7 @@ link_is_metered() {                    # metered flag on the default-route iface
   nmcli -t -f GENERAL.METERED device show "$dev" 2>/dev/null | grep -qi ':yes'
 }
 
-if [[ "$SKIP_IF_METERED" == "true" ]] && link_is_metered; then
+if (( ! FORCE )) && [[ "$SKIP_IF_METERED" == "true" ]] && link_is_metered; then
   log "On a metered connection; skipping (not a failure)."   # silent to the DMS
   stale_exit "metered connection"
 fi
@@ -477,8 +581,8 @@ run_step "backup" restic backup \
 
 # ---- Record success ----
 # .last-success is written ONLY here, and only after restic returned 0. Every
-# staleness decision reads it; a lock-skip or a failed run must never touch it,
-# or a wedged host would look freshly backed up.
+# scheduling and staleness decision reads it; a lock-skip or a failed run must
+# never touch it, or a wedged host would look freshly backed up.
 printf '%s\n' "$(date +%s)" > "$LAST_SUCCESS_FILE"
 rm -f "$NOTIFY_STATE_FILE"            # failure streak is over; next failure pages again
 

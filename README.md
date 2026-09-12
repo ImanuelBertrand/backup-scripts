@@ -19,12 +19,14 @@ from several machines (servers and a laptop) into one central **append-only**
 **Design in one paragraph.** WireGuard is the transport security, so there is no
 TLS, no reverse proxy, and no "am I on trusted Wi-Fi" logic: if `10.0.0.2`
 answers, we back up from anywhere; if it doesn't, the tunnel is down and we skip
-— silently. What turns a silent skip into an alert is the **age of the last
-successful backup**, not the reason for the skip. Independently of WireGuard, the server enforces `--append-only` (a
+or alert. Independently of WireGuard, the server enforces `--append-only` (a
 compromised client cannot delete its own history) and `--private-repos` (clients
 sharing the WG subnet cannot read or delete each other's repos). Retention and
 pruning never run on clients — they run locally on the backup host, which is the
-only place with delete rights.
+only place with delete rights. Cron invokes the client script **hourly** and the
+script decides for itself whether this hour is the moment (§4); a skip is always
+silent, and what turns silence into an alert is the **age of the last successful
+backup**, not the reason for the skip.
 
 ## Contents
 
@@ -34,6 +36,7 @@ only place with delete rights.
 | `config.sample` | client, → `~/.config/restic/config` | Per-host settings **and secrets**. Never commit the filled-in copy. |
 | `excludes` | client, → `~/.config/restic/excludes` | Shared exclude patterns. No secrets; committed. |
 | `pre-backup` | client, → `~/.config/restic/pre-backup` | **Optional** hook for what the config can't express. Omit if unneeded. |
+| `restic-backup.cron` | client, → `/etc/cron.d/restic-backup` | Hourly invocation. The **script** decides when to actually run. |
 | `docker-compose.yml` | backup host | The rest-server. |
 
 ## Prerequisites
@@ -42,6 +45,7 @@ only place with delete rights.
   **≤** the maintenance host's version — a newer client can write a repo format
   the maintenance host cannot prune.
 - `curl` on clients (notifications, reachability probe).
+- `cron` on clients (`cronie` on Fedora/RHEL). No systemd timers are used.
 - Docker + Compose on the backup host.
 - A working WireGuard tunnel (set up separately — see below).
 - Optional: `nmcli` for metered-link detection, `sqlite3` / `mariadb-dump` /
@@ -200,20 +204,22 @@ Then set the per-host behaviour:
 |---|---|---|
 | `SKIP_IF_METERED` | `"false"` | `"true"` |
 | `MAX_BACKUP_AGE_HOURS` | `"36"` — one missed night is fine, two is not | `"168"` — a week away from the tunnel is normal |
+| `BACKUP_WINDOW` | `"23-06"` | `"23-06"` (rarely satisfied — see note) |
 | `WG_INTERFACE` | `"wg0"` if the tunnel is local to this host | `"wg0"` |
 | `EXTRA_BACKUP_ARGS` | `(--one-file-system)` | `(--one-file-system)` |
 
 > **`SKIP_IF_UNREACHABLE` is gone.** An unreachable backend is now *always* a
 > silent skip, and `MAX_BACKUP_AGE_HOURS` decides when a run of silent skips
-> becomes a failure. That is strictly better than the old boolean: with `"true"`
-> a laptop whose tunnel was broken for a week said nothing at all, and with
-> `"false"` a server said something every single run. The script warns and
+> becomes a failure. That is strictly better than the old boolean: with
+> `"true"` a laptop whose tunnel was broken for a week said nothing at all, and
+> with `"false"` a server said something every single run. The script warns and
 > ignores the variable if it is still present in a config.
 
-> **Laptop note.** Give a travelling laptop a generous `MAX_BACKUP_AGE_HOURS`
-> (a week) rather than trying to predict when it will next see the tunnel. The
-> healthchecks grace period should sit **above** whatever you choose, so the two
-> alarms don't both fire for one event.
+> **Laptop note.** A laptop asleep from 23:00 to 06:00 never satisfies
+> `BACKUP_WINDOW`, so every one of its backups comes from the
+> `FORCE_AFTER_HOURS` catch-up, at whatever daytime hour it happens to be awake.
+> That is intended. What the laptop gains from the hourly schedule is *retries* —
+> 24 chances a day to catch a moment when the tunnel is up, instead of one.
 
 Finally, notifications (all optional — leave empty to disable):
 
@@ -242,11 +248,12 @@ Expect `created restic repository … at rest:http://10.0.0.2:8000/srv01/`. A
 ### 3.5 First run
 
 ```bash
-RESTIC_CONFIG_DIR=/root/.config/restic /usr/local/sbin/restic-backup.sh
+RESTIC_CONFIG_DIR=/root/.config/restic /usr/local/sbin/restic-backup.sh --force
 ```
 
-Success is **silent by design** — no ntfy on success. You should see
-`Backup complete.` and a new snapshot:
+`--force` bypasses the window and the min-interval gates, which a first run by
+hand will otherwise trip (§4). Success is **silent by design** — no ntfy on
+success. You should see `Backup complete.` and a new snapshot:
 
 ```bash
 restic snapshots
@@ -256,47 +263,143 @@ restic snapshots
 
 ## 4. Scheduling
 
-`/etc/systemd/system/restic-backup.service`:
+**Cron calls the script every hour. The script decides whether to back up.**
 
-```ini
-[Unit]
-Description=restic backup to rest-server
-Wants=network-online.target
-After=network-online.target
+All the policy lives in the config (§3.3), not in the crontab: one line per host,
+identical everywhere, and you change behaviour by editing a file instead of a
+schedule. A run that isn't due exits in milliseconds.
 
-[Service]
-Type=oneshot
-Environment=RESTIC_CONFIG_DIR=/root/.config/restic
-ExecStart=/usr/local/sbin/restic-backup.sh
-Nice=10
-IOSchedulingClass=idle
+### 4.1 Install the cron entry
+
+```bash
+install -m 755 restic-backup.sh /usr/local/sbin/restic-backup.sh
+install -m 644 restic-backup.cron /etc/cron.d/restic-backup      # NOTE: no .cron suffix
 ```
 
-`/etc/systemd/system/restic-backup.timer`:
+```
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+MAILTO=""
+RESTIC_CONFIG_DIR=/root/.config/restic
 
-```ini
-[Unit]
-Description=Daily restic backup
+# m  h dom mon dow  user  command
+  23 * *   *   *    root  nice -n10 ionice -c3 /usr/local/sbin/restic-backup.sh 2>&1 | logger -t restic-backup
+```
 
-[Timer]
-OnCalendar=daily
-RandomizedDelaySec=30m
-Persistent=true          # laptops: catches runs missed while suspended/off
+Five details in there, each fixing something specific to cron:
 
-[Install]
-WantedBy=timers.target
+| Detail | Why |
+|---|---|
+| filename with **no dot** | cronie *silently* ignores `/etc/cron.d` entries whose names contain a `.`. Install as `restic-backup`, not `restic-backup.cron`. Confirm with `systemctl reload crond && journalctl -u crond \| tail`. |
+| `MAILTO=""` + `logger` | `run_step` prints every stage's output. Under cron that goes to root's mail — at hourly invocation that is 24 mails per host per day, and the *silent* skips mail too. Send the lot to syslog; ntfy and healthchecks are the real alert channels. |
+| `RESTIC_CONFIG_DIR=` | The script falls back to `$HOME/.config/restic`, and `$HOME` under cron is not reliably `/root` across anacron / crontab / `cron.d`. Pin it. |
+| `nice` / `ionice` | `/etc/cron.daily` inherits `nice` from `/etc/anacrontab`; `/etc/cron.d` does not. Without this a whole-`/` backup is noticeably rude on a laptop. `ionice -c3` matters more than the nice level. |
+| a **different minute per host** | Staggers clients off the repo lock. Unlike a random delay you can see the whole fleet's spread at a glance, and reproduce it. |
+
+### 4.2 What the script does with those 24 invocations
+
+```
+BACKUP_WINDOW="23-06"        run in this local-hour window, ...
+MIN_INTERVAL_HOURS="20"      ... but not if a run succeeded this recently, ...
+FORCE_AFTER_HOURS="24"       ... and ignore the window entirely past this age.
+MAX_BACKUP_AGE_HOURS="36"    hard fail: alert once the last success is this old.
+```
+
+On a server this produces one backup a night at ~23:00, with six more chances
+before 06:00 if the first attempt finds the tunnel down.
+
+`MIN_INTERVAL_HOURS` must stay **below 24**. At exactly 24, a run that lands at
+01:00 makes the next one eligible at 01:00, and that ratchet walks the backup
+later every day until it falls out of the window entirely.
+
+> **`FORCE_AFTER_HOURS` is the only catch-up you have.** Plain cron does not
+> replay jobs missed while a machine was off or asleep — no anacron, no systemd
+> `Persistent=`. That makes `/root/.config/restic/.last-success` load-bearing: it
+> is the sole record of when a backup last worked, it is written **only** after
+> `restic backup` returns 0, and nothing else touches it. Deleting it makes the
+> host back up on its next invocation (harmless); a stale copy restored from a
+> snapshot would make it skip (which is why `MAX_BACKUP_AGE_HOURS` exists).
+
+### 4.3 A skip can no longer hide
+
+Every path that declines to back up — not due, metered link, tunnel down, lock
+held by a still-running backup — exits through the same staleness check. If the
+last success is older than `MAX_BACKUP_AGE_HOURS` the script pages you and exits
+`1`, whatever the reason for the skip.
+
+This is what makes silent skipping safe, and it closes the hole the old
+`SKIP_IF_UNREACHABLE="true"` left open: a host that quietly stops backing up now
+alerts **locally**, without waiting on the external dead-man's switch.
+
+Because 24 invocations a day must not mean 24 pushes, notification is throttled:
+
+| Event | Notification |
+|---|---|
+| First failure after a success | ntfy **urgent** — breakage is actionable now |
+| Further failures, still under `MAX_BACKUP_AGE_HOURS` | log + `/fail` ping only |
+| Crossing `MAX_BACKUP_AGE_HOURS` | ntfy **urgent** (escalation) |
+| Still stale after that | ntfy at most every `NOTIFY_REPEAT_HOURS` |
+| A successful backup | nothing — and the streak resets, so the next failure pages again |
+
+State lives in `$CONFIG_DIR/.notify-state` and is deleted on every success.
+
+### 4.4 Inspect the decision
+
+`--status` prints what the script would do and changes nothing:
+
+```console
+# restic-backup.sh --status
+last success : 2026-09-11 23:24:07 (6h29m ago)
+window       : 23-06  (now 05:53 -> inside)
+thresholds   : min-interval 20h, catch-up 24h, hard-fail 36h
+stale        : no
+decision     : not due, would skip
 ```
 
 ```bash
-systemctl daemon-reload
-systemctl enable --now restic-backup.timer
-systemctl list-timers restic-backup.timer
-journalctl -u restic-backup.service -f
+journalctl -t restic-backup -n 50        # what cron actually ran
+journalctl -t restic-backup | grep 'WG:' # tunnel restarts (see 2.1)
+restic-backup.sh --force                 # run now, ignoring every gate
 ```
 
-`RandomizedDelaySec` staggers clients so they don't collide on the repo lock.
-The script also takes a `flock` on `$CONFIG_DIR/.lock`, so overlapping runs on
-one host exit cleanly rather than piling up.
+### 4.5 Migrating from the old schedule
+
+The laptop and PC ran this out of `/etc/cron.daily`; the servers ran it from
+`/root/bin` via a classic crontab. Both go away.
+
+```bash
+# 1. seed the stamp with a known-good run, so the new schedule starts from a
+#    real success instead of backing the whole fleet up at once on deploy
+install -m 755 restic-backup.sh /usr/local/sbin/restic-backup.sh
+/usr/local/sbin/restic-backup.sh --force
+
+# 2. remove the old triggers
+rm -f /etc/cron.daily/restic-backup*          # laptop / PC
+crontab -l | grep -v restic-backup | crontab - # servers (check the output first!)
+rm -f /root/bin/restic-backup.sh               # optional; or point the cron entry there
+
+# 3. install the hourly entry, with a minute unique to this host
+install -m 644 restic-backup.cron /etc/cron.d/restic-backup
+$EDITOR /etc/cron.d/restic-backup
+
+# 4. confirm
+/usr/local/sbin/restic-backup.sh --status
+```
+
+Then drop `SKIP_IF_UNREACHABLE` from each config and add
+`MAX_BACKUP_AGE_HOURS` (§3.3).
+
+> **Leaving `/etc/cron.daily` costs you anacron's catch-up**, which on Fedora is
+> what has been backing up the laptop after every boot. `FORCE_AFTER_HOURS`
+> replaces it — which is why it is worth running the new script on the old
+> schedule for a few days first, and checking `--status` reports a sane
+> `last success`, before you pull the anacron entry.
+
+> **Retune the healthchecks grace period** to sit above `MAX_BACKUP_AGE_HOURS`
+> (48h for a 36h server). The local staleness check is now the fast alarm; the
+> external dead-man's switch is there for the case the whole host is dead and
+> cannot alert about anything. Two alarms at the same threshold just means two
+> pushes for one event.
 
 ---
 
@@ -394,7 +497,9 @@ Three things to be deliberate about:
   password. Treat it as being as sensitive as all the clients combined; `0600`,
   root-only, ideally on encrypted storage.
 - **Prune takes the repo lock.** Clients wait `LOCK_WAIT` (default 15m) via
-  `--retry-lock`, so schedule maintenance well away from client backup windows.
+  `--retry-lock`, so schedule maintenance well away from the client window —
+  with the default `BACKUP_WINDOW="23-06"`, and catch-up runs possible at any
+  hour, late morning is the safe slot.
 - **`restic check` doesn't read the data** by default. Periodically run
   `restic check --read-data-subset=5%` to catch bit-rot; a full `--read-data`
   occasionally if the repo size allows.
@@ -430,27 +535,10 @@ can read a repo given those three, which is why §3.2 matters.
 
 | Channel | When | Notes |
 |---|---|---|
-| ntfy (`urgent`) | First failure after a success; crossing `MAX_BACKUP_AGE_HOURS`; then every `NOTIFY_REPEAT_HOURS` | Success is intentionally silent. Throttled — see below. |
-| Local staleness check | Every run, including every skip | The fast alarm: catches a host that is alive but quietly not backing up. |
+| ntfy (`urgent`) | First failure after a success; crossing `MAX_BACKUP_AGE_HOURS`; then every `NOTIFY_REPEAT_HOURS` | Success is intentionally silent. Throttled — see §4.3. |
+| Local staleness check | Every invocation, including every skip | The fast alarm: catches a host that is alive but quietly not backing up. |
 | healthchecks ping | `/start`, success, `/fail` | The slow alarm: catches a host too dead to alert for itself. Grace period should sit **above** `MAX_BACKUP_AGE_HOURS`. |
 | `notify-send` | Failure, desktop only | Best-effort. |
-
-Every path that declines to back up — metered link, tunnel down, lock held by a
-still-running backup — exits through the same staleness check. If the last
-success is older than `MAX_BACKUP_AGE_HOURS` the script pages you and exits `1`,
-whatever the reason for the skip. This is what makes silent skipping safe.
-
-Notification is throttled so that a stuck host does not push on every run:
-
-| Event | Notification |
-|---|---|
-| First failure after a success | ntfy **urgent** — breakage is actionable now |
-| Further failures, still under `MAX_BACKUP_AGE_HOURS` | log + `/fail` ping only |
-| Crossing `MAX_BACKUP_AGE_HOURS` | ntfy **urgent** (escalation) |
-| Still stale after that | ntfy at most every `NOTIFY_REPEAT_HOURS` |
-| A successful backup | nothing — and the streak resets, so the next failure pages again |
-
-State lives in `$CONFIG_DIR/.notify-state` and is deleted on every success.
 
 Test the alerting path deliberately — point `RESTIC_REPOSITORY` at a bogus URL
 and confirm the ntfy message and `/fail` ping actually arrive. Silent-on-success
@@ -461,7 +549,7 @@ The staleness path is worth testing too, and it is cheap:
 ```bash
 # pretend the last success was 40h ago; expect one urgent ntfy and exit 1
 printf '%s\n' $(( $(date +%s) - 40*3600 )) > /root/.config/restic/.last-success
-/usr/local/sbin/restic-backup.sh
+restic-backup.sh --status          # 'stale: YES -- would alert'
 ```
 
 Then let a real run repair it, or delete `.last-success` to reset.
@@ -476,13 +564,16 @@ Then let a real run repair it, or delete `.last-success` to reset.
 | Timeout / `unreachable` | WireGuard down. `wg show`, then `curl -i http://10.0.0.2:8000/`. |
 | `repository is already locked` | Concurrent maintenance prune. Clients retry for `LOCK_WAIT`; raise it or move the maintenance window. |
 | `Another run holds the lock; exiting.` | A previous run is still going (`flock`). Not an error — but it still checks staleness, so a run wedged for days does alert. |
-| Backup skipped, no alert | Metered link or tunnel down, and the last success is still within `MAX_BACKUP_AGE_HOURS`. By design; no ping is sent. |
+| `Not due …; exiting.` | Normal, 23 times a day. `--status` shows why. |
+| Backup skipped, no alert | Metered link, tunnel down, or not due — and the last success is still within `MAX_BACKUP_AGE_HOURS`. By design; no ping is sent. |
 | `STALE: no successful backup for …` | The hard fail. The host is alive but hasn't backed up in `MAX_BACKUP_AGE_HOURS`; the log line above it says which skip path it took. |
-| `notification suppressed (already alerted…)` | Throttling, not a new problem. The original push already went out. |
-| `WG: 'wg-quick up wg0' FAILED — the tunnel is now DOWN` | The bounce brought the tunnel down and could not bring it back (endpoint unresolvable). Fix the tunnel by hand; the script won't retry until the next run. |
+| `notification suppressed (already alerted…)` | Throttling (§4.3), not a new problem. The original push already went out. |
+| Nothing runs at all after migrating | `/etc/cron.d` entry has a dot in its filename — cronie ignores it silently. Rename, `systemctl reload crond`. |
+| `WG: 'wg-quick up wg0' FAILED — the tunnel is now DOWN` | The bounce brought the tunnel down and could not bring it back (endpoint unresolvable). Fix the tunnel by hand; the script won't retry until the next invocation. |
+| Cron mails you 24 times a day | `MAILTO=""` missing from `/etc/cron.d/restic-backup`, or the `logger` redirect dropped. |
 | Dump fails, whole backup aborts | Intended. Fix the dump — don't disable the check. |
 | `no mariadb-dump/pg_dumpall in container` | `DOCKER_AUTO` on a SQLite container. Use `SQLITE_FILES` with the host path, or the hook. |
-| Alert fires but no desktop popup | `notify-send` from a root systemd unit can't reach your session. The ntfy message is the real channel. |
+| Alert fires but no desktop popup | `notify-send` from a root cron job can't reach your session. The ntfy message is the real channel. |
 | Exclude pattern silently ignored | restic treats `#` as a comment **only** at the start of a line. An inline comment becomes part of the pattern. |
 
 ---

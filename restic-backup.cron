@@ -1,0 +1,24 @@
+# restic backup -- install as /etc/cron.d/restic-backup
+#
+#   install -m 644 restic-backup.cron /etc/cron.d/restic-backup
+#
+# The target filename must NOT contain a dot: cronie silently ignores entries in
+# /etc/cron.d whose names have one. Verify the file was picked up with
+#   systemctl reload crond   &&   journalctl -u crond | tail
+#
+# HOURLY on purpose. The script itself decides whether this hour is the moment
+# (BACKUP_WINDOW / MIN_INTERVAL_HOURS / FORCE_AFTER_HOURS in the config) and
+# exits in milliseconds when it is not. Cron does NOT replay jobs missed while
+# the machine was off or asleep, so FORCE_AFTER_HOURS is the only catch-up a
+# laptop gets -- do not disable it.
+#
+# GIVE EVERY HOST A DIFFERENT MINUTE. It staggers clients off the repo lock, and
+# unlike a random delay you can see the spread at a glance across your fleet.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+MAILTO=""
+RESTIC_CONFIG_DIR=/root/.config/restic
+
+# m  h dom mon dow  user  command
+  23 * *   *   *    root  nice -n10 ionice -c3 /usr/local/sbin/restic-backup.sh 2>&1 | logger -t restic-backup
