@@ -165,6 +165,15 @@ remote_sha() {                         # remote_sha <sha256sum-output> <path>
 # lines. Shared by --check and the plan pass so the two modes cannot disagree
 # about what a healthy host needs -- none of these can be seen from here, and
 # every one of them is a host that installs cleanly and then never backs up.
+#
+# Collapse its output into one line. awk, not `paste -sd, - | sed 's/,/, /g'`:
+# that sed spaced out every comma, including the ones inside a message, so a
+# probe line with internal punctuation rendered "(health check,  ntfy,  dead-
+# mans switch)". Joining at the real boundaries is what was meant.
+prereq_list() {                        # prereq_list <probe output>
+  awk '/^#PRE /{ sub(/^#PRE /, ""); out = (out ? out ", " : "") $0 } END { print out }' <<<"$1"
+}
+
 prereq_probe() {
   cat <<EOF
 command -v restic >/dev/null 2>&1 || echo '#PRE restic is not installed'
@@ -199,7 +208,7 @@ if (( CHECK_ONLY )); then
     # Same round trip, and --status runs LAST so $? is still its own exit code.
     out=$(ssh -n "${SSH_OPTS[@]}" "$(addr_of "$h")" "$(prereq_probe)
          RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" 2>&1) && s=0 || s=$?
-    prereq="$(sed -n 's/^#PRE //p' <<<"$out" | paste -sd, - | sed 's/,/, /g')"
+    prereq="$(prereq_list "$out")"
     [[ -n "$prereq" ]] && PREREQ[$h]="$prereq"
     sed '/^#PRE /d' <<<"$out"
     # 3 is --status's "past MAX_BACKUP_AGE_HOURS". It used to print
@@ -256,7 +265,7 @@ for h in "${HOSTS[@]}"; do
 $(prereq_probe)
       true" 2>/dev/null)" || {
     unreachable+=("$h"); PLAN[$h]="unreachable"; continue; }
-  prereq="$(sed -n 's/^#PRE //p' <<<"$remote" | paste -sd, - | sed 's/,/, /g')"
+  prereq="$(prereq_list "$remote")"
   [[ -n "$prereq" ]] && PREREQ[$h]="$prereq"
   r_sh=$(remote_sha "$remote" "$SBIN_PATH")
   r_ex=$(remote_sha "$remote" "$CONFIG_DIR/excludes")
