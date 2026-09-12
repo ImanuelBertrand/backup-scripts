@@ -19,7 +19,8 @@ from several machines (servers and a laptop) into one central **append-only**
 **Design in one paragraph.** WireGuard is the transport security, so there is no
 TLS, no reverse proxy, and no "am I on trusted Wi-Fi" logic: if `10.0.0.2`
 answers, we back up from anywhere; if it doesn't, the tunnel is down and we skip
-or alert. Independently of WireGuard, the server enforces `--append-only` (a
+— silently. What turns a silent skip into an alert is the **age of the last
+successful backup**, not the reason for the skip. Independently of WireGuard, the server enforces `--append-only` (a
 compromised client cannot delete its own history) and `--private-repos` (clients
 sharing the WG subnet cannot read or delete each other's repos). Retention and
 pruning never run on clients — they run locally on the backup host, which is the
@@ -174,13 +175,20 @@ Then set the per-host behaviour:
 | Setting | Servers | Laptop |
 |---|---|---|
 | `SKIP_IF_METERED` | `"false"` | `"true"` |
-| `SKIP_IF_UNREACHABLE` | `"false"` — tunnel down is a failure | see note |
+| `MAX_BACKUP_AGE_HOURS` | `"36"` — one missed night is fine, two is not | `"168"` — a week away from the tunnel is normal |
 | `EXTRA_BACKUP_ARGS` | `(--one-file-system)` | `(--one-file-system)` |
 
-> **Laptop note.** A silent skip sends **no** healthchecks ping, so the dead-man's
-> switch will eventually flag the host as late while you're travelling. Either set
-> `SKIP_IF_UNREACHABLE="true"` and give that check a long grace period, or leave
-> it `"false"` and accept one failure alert per run whenever the tunnel is down.
+> **`SKIP_IF_UNREACHABLE` is gone.** An unreachable backend is now *always* a
+> silent skip, and `MAX_BACKUP_AGE_HOURS` decides when a run of silent skips
+> becomes a failure. That is strictly better than the old boolean: with `"true"`
+> a laptop whose tunnel was broken for a week said nothing at all, and with
+> `"false"` a server said something every single run. The script warns and
+> ignores the variable if it is still present in a config.
+
+> **Laptop note.** Give a travelling laptop a generous `MAX_BACKUP_AGE_HOURS`
+> (a week) rather than trying to predict when it will next see the tunnel. The
+> healthchecks grace period should sit **above** whatever you choose, so the two
+> alarms don't both fire for one event.
 
 Finally, notifications (all optional — leave empty to disable):
 
@@ -396,13 +404,41 @@ can read a repo given those three, which is why §3.2 matters.
 
 | Channel | When | Notes |
 |---|---|---|
-| ntfy (`urgent`) | Failure only | Success is intentionally silent. |
-| healthchecks ping | `/start`, success, `/fail` | Catches the case where the script never runs at all. |
+| ntfy (`urgent`) | First failure after a success; crossing `MAX_BACKUP_AGE_HOURS`; then every `NOTIFY_REPEAT_HOURS` | Success is intentionally silent. Throttled — see below. |
+| Local staleness check | Every run, including every skip | The fast alarm: catches a host that is alive but quietly not backing up. |
+| healthchecks ping | `/start`, success, `/fail` | The slow alarm: catches a host too dead to alert for itself. Grace period should sit **above** `MAX_BACKUP_AGE_HOURS`. |
 | `notify-send` | Failure, desktop only | Best-effort. |
+
+Every path that declines to back up — metered link, tunnel down, lock held by a
+still-running backup — exits through the same staleness check. If the last
+success is older than `MAX_BACKUP_AGE_HOURS` the script pages you and exits `1`,
+whatever the reason for the skip. This is what makes silent skipping safe.
+
+Notification is throttled so that a stuck host does not push on every run:
+
+| Event | Notification |
+|---|---|
+| First failure after a success | ntfy **urgent** — breakage is actionable now |
+| Further failures, still under `MAX_BACKUP_AGE_HOURS` | log + `/fail` ping only |
+| Crossing `MAX_BACKUP_AGE_HOURS` | ntfy **urgent** (escalation) |
+| Still stale after that | ntfy at most every `NOTIFY_REPEAT_HOURS` |
+| A successful backup | nothing — and the streak resets, so the next failure pages again |
+
+State lives in `$CONFIG_DIR/.notify-state` and is deleted on every success.
 
 Test the alerting path deliberately — point `RESTIC_REPOSITORY` at a bogus URL
 and confirm the ntfy message and `/fail` ping actually arrive. Silent-on-success
 monitoring is only as good as the last time you proved the alarm works.
+
+The staleness path is worth testing too, and it is cheap:
+
+```bash
+# pretend the last success was 40h ago; expect one urgent ntfy and exit 1
+printf '%s\n' $(( $(date +%s) - 40*3600 )) > /root/.config/restic/.last-success
+/usr/local/sbin/restic-backup.sh
+```
+
+Then let a real run repair it, or delete `.last-success` to reset.
 
 ---
 
@@ -413,8 +449,10 @@ monitoring is only as good as the last time you proved the alarm works.
 | `401 Unauthorized` | `RESTIC_REST_USERNAME` ≠ first path segment of the repo URL (`--private-repos`), or wrong htpasswd password. |
 | Timeout / `unreachable` | WireGuard down. `wg show`, then `curl -i http://10.0.0.2:8000/`. |
 | `repository is already locked` | Concurrent maintenance prune. Clients retry for `LOCK_WAIT`; raise it or move the maintenance window. |
-| `Another run holds the lock; exiting.` | A previous run is still going (`flock`). Not an error. |
-| Backup skipped, no alert | Metered link, or `SKIP_IF_UNREACHABLE="true"`. By design; no ping is sent. |
+| `Another run holds the lock; exiting.` | A previous run is still going (`flock`). Not an error — but it still checks staleness, so a run wedged for days does alert. |
+| Backup skipped, no alert | Metered link or tunnel down, and the last success is still within `MAX_BACKUP_AGE_HOURS`. By design; no ping is sent. |
+| `STALE: no successful backup for …` | The hard fail. The host is alive but hasn't backed up in `MAX_BACKUP_AGE_HOURS`; the log line above it says which skip path it took. |
+| `notification suppressed (already alerted…)` | Throttling, not a new problem. The original push already went out. |
 | Dump fails, whole backup aborts | Intended. Fix the dump — don't disable the check. |
 | `no mariadb-dump/pg_dumpall in container` | `DOCKER_AUTO` on a SQLite container. Use `SQLITE_FILES` with the host path, or the hook. |
 | Alert fires but no desktop popup | `notify-send` from a root systemd unit can't reach your session. The ntfy message is the real channel. |

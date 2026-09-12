@@ -71,19 +71,26 @@ SQLITE_FILES=()       # (name:/path/to.db ...)          -- host path, incl. bind
 # PRE_BACKUP_HOOK="$HOME/.config/restic/pre-backup"
 # DUMP_DIR="$HOME/.config/restic/db-dumps"
 
+# ---- Staleness = the hard fail ----------------------------------------------
+# THIS replaces the old SKIP_IF_UNREACHABLE boolean. Skipping is always silent;
+# what turns silence into an alert is age. Every path that declines to back up
+# (metered, tunnel down, lock held) checks this first, so a host that quietly
+# stops backing up pages you locally instead of waiting on the external
+# dead-man's switch.
+#
+#   servers          : 36   (one missed night is fine; two is not)
+#   laptop that travels: 168 (a week away from the tunnel is normal)
+#   0                : never hard-fail on age (you then have ONLY the DMS)
+MAX_BACKUP_AGE_HOURS="36"
+
+# While stale, re-page at most this often: the first failure after a success
+# always pages, further failures are log-only until the MAX_BACKUP_AGE crossing,
+# and from there it repeats at this interval until a backup succeeds.
+NOTIFY_REPEAT_HOURS="12"
+
 # ---- Network gating ---------------------------------------------------------
 # Skip on metered links (cellular cost). TRUE on laptops, FALSE on wired servers.
 SKIP_IF_METERED="true"
-
-# Behaviour when the backend (10.0.0.2) is unreachable -- WireGuard down, or
-# off-LAN with no route:
-#   "false" -> treat as a FAILURE and alert. Right for always-on servers.
-#   "true"  -> skip silently (not a failure). Right for laptops that travel.
-# LAPTOP NOTE: a silent skip sends NO ping, so the healthchecks DMS below will
-# eventually flag the host "late/down" while you are away. For a laptop either
-# set this TRUE and give that check a long grace period, or leave it FALSE and
-# accept one failure alert per run whenever the tunnel is down.
-SKIP_IF_UNREACHABLE="false"
 
 # Reachability probe. Any HTTP response (even 401) counts as "reachable" -- this
 # only tests that the WG route is up, not auth. Point at the rest-server root.

@@ -21,10 +21,43 @@ set -euo pipefail
 # self-heal stale locks from interrupted laptop runs; stale-only, so it can't
 # disturb a live maintenance prune.
 #
+# ---------------------------------------------------------------------------
+# SKIPPING IS SILENT; AGE IS WHAT ALERTS. Every path that declines to back up
+# (metered link, tunnel down, lock held) exits through stale_exit(), which pages
+# you once the last SUCCESSFUL backup is older than MAX_BACKUP_AGE_HOURS=36. A
+# host that quietly stops backing up therefore alerts LOCALLY, instead of relying
+# on the external dead-man's switch to notice eventually. That is what makes a
+# silent skip safe: it can no longer hide.
+#
+# $CONFIG_DIR/.last-success is written ONLY after `restic backup` returns 0, and
+# is the sole record of when a backup last worked.
+#
+# Notifications are throttled to match: only the first failure after a success,
+# and the crossing of MAX_BACKUP_AGE, page you (see notify_failure).
+# ---------------------------------------------------------------------------
+#
 # Requires restic >= 0.16 (--retry-lock). Keep client restic <= maintenance host.
 # ============================================================================
 
 export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+
+# ---- Small helpers (needed while validating the config) ----
+log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*"; }
+
+fmt_age() {                            # seconds -> "12h34m" ("never" for < 0)
+  local s="${1:-0}"
+  (( s < 0 )) && { printf 'never'; return; }
+  printf '%dh%02dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+}
+
+read_epoch() {                         # file -> epoch on stdout, 0 if unusable
+  local f="$1" v=0
+  if [[ -s "$f" ]]; then
+    read -r v < "$f" || v=0
+    [[ "$v" =~ ^[0-9]+$ ]] || v=0
+  fi
+  printf '%s' "$v"
+}
 
 # ---- Load per-host config ----
 CONFIG_DIR="${RESTIC_CONFIG_DIR:-$HOME/.config/restic}"
@@ -43,7 +76,32 @@ EXCLUDE_FILE="${EXCLUDE_FILE:-$CONFIG_DIR/excludes}"
 DUMP_DIR="${DUMP_DIR:-$CONFIG_DIR/db-dumps}"
 LOCK_WAIT="${LOCK_WAIT:-15m}"
 SKIP_IF_METERED="${SKIP_IF_METERED:-false}"
-SKIP_IF_UNREACHABLE="${SKIP_IF_UNREACHABLE:-false}"
+
+# Staleness. Hours; 0 disables the rule.
+MAX_BACKUP_AGE_HOURS="${MAX_BACKUP_AGE_HOURS:-36}"   # 0 = never hard-fail on age
+NOTIFY_REPEAT_HOURS="${NOTIFY_REPEAT_HOURS:-12}"     # re-page interval while stale
+
+if declare -p SKIP_IF_UNREACHABLE &>/dev/null; then
+  log "WARN: SKIP_IF_UNREACHABLE is obsolete and ignored -- an unreachable backend is"
+  log "WARN: now always a silent skip, and MAX_BACKUP_AGE_HOURS decides when that"
+  log "WARN: becomes a failure. Delete it from $CONFIG_DIR/config."
+fi
+
+for _v in MAX_BACKUP_AGE_HOURS NOTIFY_REPEAT_HOURS; do
+  declare -n _r="$_v"
+  if [[ ! "$_r" =~ ^[0-9]+$ ]]; then log "WARN: $_v='$_r' is not an integer; using 0"; _r=0; fi
+done
+unset -n _r; unset _v
+
+MAX_AGE_SEC=$(( MAX_BACKUP_AGE_HOURS * 3600 ))
+NOTIFY_REPEAT_SEC=$(( NOTIFY_REPEAT_HOURS * 3600 ))
+
+# State. Cheap, local, and the only thing that survives a reboot: .last-success
+# is what every staleness decision is measured against.
+LAST_SUCCESS_FILE="$CONFIG_DIR/.last-success"
+FIRST_SEEN_FILE="$CONFIG_DIR/.first-seen"
+NOTIFY_STATE_FILE="$CONFIG_DIR/.notify-state"
+ALERT_AGE_SEC=-1                       # set for real below; safe default for the ERR trap
 
 # ntfy (failure-only; success is intentionally silent)
 NTFY_URL="${NTFY_URL:-}"
@@ -52,7 +110,6 @@ NTFY_TOKEN="${NTFY_TOKEN:-}"
 PING_URL="${RESTIC_PING_URL:-}"
 
 # ---- Helpers ----
-log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*"; }
 ping_dms() { [[ -n "$PING_URL" ]] || return 0; curl -fsS -m 10 --retry 3 "$1" >/dev/null 2>&1 || true; }
 
 ntfy() {
@@ -63,14 +120,49 @@ ntfy() {
     "$NTFY_URL/$topic" >/dev/null 2>&1 || log "WARN: ntfy send failed"
 }
 
+# Hourly invocation means a stuck host would push 24 urgent notifications a day.
+# Policy, keyed off $NOTIFY_STATE_FILE ("<first> <last> <hard>", removed on every
+# success):
+#   - first failure after a success  -> always push (breakage is actionable NOW)
+#   - later failures, still under MAX_BACKUP_AGE -> log + DMS only
+#   - crossing MAX_BACKUP_AGE        -> push once more (escalation)
+#   - beyond that                    -> push at most every NOTIFY_REPEAT_HOURS
+# Returns 0 if this event should be pushed. Always records the attempt.
+notify_should_push() {
+  local hard="$1" now first last hardflag
+  now=$(date +%s)
+  if [[ ! -s "$NOTIFY_STATE_FILE" ]]; then
+    printf '%s %s %s\n' "$now" "$now" "$hard" > "$NOTIFY_STATE_FILE"
+    return 0
+  fi
+  first=0; last=0; hardflag=0
+  read -r first last hardflag < "$NOTIFY_STATE_FILE" || true
+  [[ "$first"    =~ ^[0-9]+$ ]] || first="$now"
+  [[ "$last"     =~ ^[0-9]+$ ]] || last=0
+  [[ "$hardflag" =~ ^[01]$   ]] || hardflag=0
+  if (( hard == 1 )) && { (( hardflag == 0 )) || (( now - last >= NOTIFY_REPEAT_SEC )); }; then
+    printf '%s %s 1\n' "$first" "$now" > "$NOTIFY_STATE_FILE"
+    return 0
+  fi
+  printf '%s %s %s\n' "$first" "$last" "$hardflag" > "$NOTIFY_STATE_FILE"
+  return 1
+}
+
 notify_failure() {
-  local stage="$1" code="$2" output="$3"
+  local stage="$1" code="$2" output="$3" hard=0 last_txt="never"
   ping_dms "$PING_URL/fail"
+  if (( MAX_AGE_SEC > 0 && ALERT_AGE_SEC >= MAX_AGE_SEC )); then hard=1; fi
+  if (( ${LAST_SUCCESS:-0} > 0 )); then last_txt="$(date -d "@$LAST_SUCCESS" '+%Y-%m-%d %H:%M') ($(fmt_age "$ALERT_AGE_SEC") ago)"; fi
+  if ! notify_should_push "$hard"; then
+    log "NOTICE: '$stage' failed (exit $code); notification suppressed (already alerted, age $(fmt_age "$ALERT_AGE_SEC"))"
+    return 0
+  fi
   ntfy "$NTFY_TOPIC_HIGH" urgent rotating_light \
     "Backup FAILED on $(hostname) ($stage)" \
 "Host:  $(hostname)
 Stage: $stage
 Exit:  $code
+Last good backup: $last_txt
 $(printf '%s' "$output" | tail -c 1500)"
   command -v notify-send >/dev/null 2>&1 \
     && notify-send -u critical "restic backup failed" "$stage (exit $code)" 2>/dev/null || true
@@ -218,11 +310,53 @@ _have_db_config() {
   return 1
 }
 
+# ============================================================================
+#  AGE OF THE LAST SUCCESSFUL BACKUP
+#
+#  ALERT_AGE_SEC is measured from .first-seen when there has never been a
+#  success -- otherwise a host installed this morning would page you as "36h
+#  stale" on day one.
+# ============================================================================
+NOW=$(date +%s)
+LAST_SUCCESS=$(read_epoch "$LAST_SUCCESS_FILE")
+FIRST_SEEN=$(read_epoch "$FIRST_SEEN_FILE")
+(( FIRST_SEEN > 0 )) || FIRST_SEEN=$NOW
+
+if (( LAST_SUCCESS > 0 )); then
+  ALERT_AGE_SEC=$(( NOW - LAST_SUCCESS ))
+  if (( ALERT_AGE_SEC < 0 )); then
+    log "WARN: .last-success lies in the future (clock skew?); treating as just-run."
+    ALERT_AGE_SEC=0
+  fi
+else
+  ALERT_AGE_SEC=$(( NOW - FIRST_SEEN ))
+  if (( ALERT_AGE_SEC < 0 )); then ALERT_AGE_SEC=0; fi
+fi
+
+# Every exit path that did NOT back up comes through here, so that a host which
+# quietly stops backing up still alerts -- locally, without waiting on the
+# external dead-man's switch. Exits 1 when stale (a real failure), else 0.
+stale_exit() {
+  local reason="$1"
+  if (( MAX_AGE_SEC > 0 && ALERT_AGE_SEC >= MAX_AGE_SEC )); then
+    log "STALE: no successful backup for $(fmt_age "$ALERT_AGE_SEC") (limit ${MAX_BACKUP_AGE_HOURS}h)."
+    notify_failure "stale: $reason" 1 \
+"No successful backup for $(fmt_age "$ALERT_AGE_SEC") -- limit is ${MAX_BACKUP_AGE_HOURS}h.
+This run did not back up: $reason"
+    exit 1
+  fi
+  exit 0
+}
+
 # ---- Single-instance lock ----
+# The newcomer exits quietly -- but still through stale_exit, so a run wedged for
+# days is not mistaken for a healthy host.
 if command -v flock >/dev/null 2>&1; then
   exec 9>"$CONFIG_DIR/.lock"
-  flock -n 9 || { log "Another run holds the lock; exiting."; exit 0; }
+  flock -n 9 || { log "Another run holds the lock; exiting."; stale_exit "another run holds the lock"; }
 fi
+
+if [[ ! -s "$FIRST_SEEN_FILE" ]]; then printf '%s\n' "$FIRST_SEEN" > "$FIRST_SEEN_FILE"; fi
 
 # ---- Network gate ----
 # Only knob left: skip metered links (cellular cost). Reachability of 10.0.0.2
@@ -236,16 +370,15 @@ link_is_metered() {                    # metered flag on the default-route iface
 
 if [[ "$SKIP_IF_METERED" == "true" ]] && link_is_metered; then
   log "On a metered connection; skipping (not a failure)."   # silent to the DMS
-  exit 0
+  stale_exit "metered connection"
 fi
 
 # ---- Backend reachable? (10.0.0.2 is routable only through WireGuard) ----
+# Unreachable is a SILENT skip whatever the host is: stale_exit decides, from
+# the age of the last success, whether this particular silence is a failure.
 if [[ -n "${REST_HEALTH_URL:-}" ]] && ! curl -sS -o /dev/null -m 8 "$REST_HEALTH_URL"; then
-  if [[ "$SKIP_IF_UNREACHABLE" == "true" ]]; then
-    log "Backend $REST_HEALTH_URL unreachable (WG down?); skipping (not a failure)."; exit 0
-  fi
   log "Backend $REST_HEALTH_URL unreachable (WG down?)."
-  notify_failure "reachability" 1 "Could not reach $REST_HEALTH_URL"; exit 1
+  stale_exit "backend unreachable (WireGuard down?)"
 fi
 
 ping_dms "$PING_URL/start"
@@ -287,6 +420,13 @@ run_step "backup" restic backup \
   "${BACKUP_PATHS[@]}"
 
 # No forget/prune/check here (append-only; retention lives on the maintenance host).
+
+# ---- Record success ----
+# .last-success is written ONLY here, and only after restic returned 0. Every
+# staleness decision reads it; a lock-skip or a failed run must never touch it,
+# or a wedged host would look freshly backed up.
+printf '%s\n' "$(date +%s)" > "$LAST_SUCCESS_FILE"
+rm -f "$NOTIFY_STATE_FILE"            # failure streak is over; next failure pages again
 
 log "Backup complete."
 ping_dms "$PING_URL"
