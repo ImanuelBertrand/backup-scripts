@@ -20,6 +20,13 @@
 # =============================================================================
 
 # ---- Taking a shared exclusion BACK (prefix "!") ----------------------------
+# A "!" only takes back a pattern that named the path ITSELF. restic follows
+# gitignore: an excluded DIRECTORY is never descended into, so "!a/b/keep"
+# rescues nothing out of an excluded "a/b" -- you get an empty "a" in the
+# snapshot and no error anywhere. To keep one child, exclude the CHILDREN:
+#     a/b/*
+#     !a/b/keep
+#
 # On a production host a restore that already contains the dependency tree is
 # deterministic and needs no network. The shared file excludes these; undo it
 # here, for this host only:

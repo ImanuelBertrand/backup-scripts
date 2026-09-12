@@ -411,8 +411,16 @@ DUMP_DIR="${DUMP_DIR:-$CONFIG_DIR/db-dumps}"
 # LOAD-BEARING. restic lets a later pattern override an earlier one, so a host
 # keeps something the fleet-wide file drops by writing "!.venv" in excludes.local
 # -- and that only works while the local file comes SECOND. Reversed, the base
-# wins and the negation silently does nothing. (restic 0.18: a child can even be
-# rescued out of an excluded parent directory, unlike gitignore.)
+# wins and the negation silently does nothing.
+#
+# A "!" can only take back a pattern that named the path ITSELF. restic follows
+# gitignore here: an excluded DIRECTORY is never descended into, so
+# "!a/b/keep" rescues nothing out of an excluded "a/b" -- the snapshot gets an
+# empty "a", and there is no error to notice. To keep one child, exclude the
+# CHILDREN and negate below that:
+#     a/b/*
+#     !a/b/keep
+# (checked against restic 0.18.1 and 0.19.1)
 #
 # The local file is OPTIONAL and is passed ONLY when it is readable: restic exits
 # 1 on an --exclude-file it cannot open, so passing it unconditionally would fail
