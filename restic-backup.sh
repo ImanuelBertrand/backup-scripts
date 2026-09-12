@@ -284,7 +284,8 @@ version_status() {
 #   - first failure after a success  -> always push (breakage is actionable NOW)
 #   - later failures, still under MAX_BACKUP_AGE -> log + DMS only
 #   - crossing MAX_BACKUP_AGE        -> push once more (escalation)
-#   - beyond that                    -> push at most every NOTIFY_REPEAT_HOURS
+#   - beyond that                    -> push at most every NOTIFY_REPEAT_HOURS,
+#                                       or never again if that is 0
 # Returns 0 if this event should be pushed. Always records the attempt.
 notify_should_push() {
   local hard="$1" now first last hardflag
@@ -298,7 +299,11 @@ notify_should_push() {
   [[ "$first"    =~ ^[0-9]+$ ]] || first="$now"
   [[ "$last"     =~ ^[0-9]+$ ]] || last=0
   [[ "$hardflag" =~ ^[01]$   ]] || hardflag=0
-  if (( hard == 1 )) && { (( hardflag == 0 )) || (( now - last >= NOTIFY_REPEAT_SEC )); }; then
+  # NOTIFY_REPEAT_SEC == 0 must mean "escalate once, then stay quiet". Without
+  # the guard the comparison is trivially true and 0 would do the exact
+  # opposite of every other 0 in this config: re-page on all 24 invocations.
+  if (( hard == 1 )) && { (( hardflag == 0 )) \
+       || (( NOTIFY_REPEAT_SEC > 0 && now - last >= NOTIFY_REPEAT_SEC )); }; then
     printf '%s %s 1\n' "$first" "$now" > "$NOTIFY_STATE_FILE"
     return 0
   fi

@@ -110,6 +110,9 @@ MAX_BACKUP_AGE_HOURS="36"
 # 24 pushes: the first failure after a success always pages, further failures
 # are log-only until the MAX_BACKUP_AGE crossing, and from there it repeats at
 # this interval until a backup succeeds.
+#
+#   0 = escalate once at the MAX_BACKUP_AGE crossing and then stay quiet until
+#       a backup succeeds (you still have the log and the dead-man's switch).
 NOTIFY_REPEAT_HOURS="12"
 
 # ---- Network gating ---------------------------------------------------------
