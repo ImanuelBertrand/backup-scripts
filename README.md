@@ -280,12 +280,12 @@ Then set the per-host behaviour:
 | `WG_BOUNCE_INTERVAL_HOURS` | `"6"` (default) | `"6"` (default) |
 | `EXTRA_BACKUP_ARGS` | `(--one-file-system)` | `(--one-file-system)` |
 
-> **`SKIP_IF_UNREACHABLE` is gone.** An unreachable backend is now *always* a
-> silent skip, and `MAX_BACKUP_AGE_HOURS` decides when a run of silent skips
-> becomes a failure. That is strictly better than the old boolean: with
-> `"true"` a laptop whose tunnel was broken for a week said nothing at all, and
-> with `"false"` a server said something every single run. The script warns and
-> ignores the variable if it is still present in a config.
+> **Why there is no "skip quietly" switch.** An unreachable backend is *always*
+> a silent skip, and `MAX_BACKUP_AGE_HOURS` decides when a run of silent skips
+> becomes a failure. A boolean cannot express that: "always skip" leaves a
+> laptop whose tunnel broke a week ago saying nothing at all, and "never skip"
+> has a server saying something every single run. A config still setting
+> `SKIP_IF_UNREACHABLE` gets a warning, and the variable is ignored.
 
 > **Laptop note.** A laptop asleep from 23:00 to 06:00 never satisfies
 > `BACKUP_WINDOW`, so every one of its backups comes from the
@@ -392,7 +392,7 @@ later every day until it falls out of the window entirely.
 > host back up on its next invocation (harmless); a stale copy restored from a
 > snapshot would make it skip (which is why `MAX_BACKUP_AGE_HOURS` exists).
 
-### 4.3 A skip can no longer hide
+### 4.3 A skip cannot hide
 
 Every path that declines to back up — not due, metered link, tunnel down —
 exits through the same staleness check. If the last success is older than
@@ -406,8 +406,7 @@ while the run in progress is perfectly healthy. That skip is judged by how
 long the lock has been held instead: quiet below `MAX_BACKUP_AGE_HOURS`, and
 a page above it, where the holder is not slow but wedged.
 
-This is what makes silent skipping safe, and it closes the hole the old
-`SKIP_IF_UNREACHABLE="true"` left open: a host that quietly stops backing up now
+This is what makes silent skipping safe: a host that quietly stops backing up
 alerts **locally**, without waiting on the external dead-man's switch.
 
 Because 24 invocations a day must not mean 24 pushes, notification is throttled:
@@ -465,10 +464,10 @@ restic-backup.sh --force                 # run now, ignoring every gate
 restic-backup.sh --check-update          # am I running the published version? (§10)
 ```
 
-### 4.5 Migrating from the old schedule
+### 4.5 Migrating from a daily cron job
 
-The laptop and PC ran this out of `/etc/cron.daily`; the servers ran it from
-`/root/bin` via a classic crontab. Both go away.
+If a host already runs restic once a day — from `/etc/cron.daily`, or a classic
+crontab entry — replace that trigger rather than adding to it.
 
 ```bash
 # 1. seed the stamp with a known-good run, so the new schedule starts from a
@@ -476,10 +475,9 @@ The laptop and PC ran this out of `/etc/cron.daily`; the servers ran it from
 install -m 755 restic-backup.sh /usr/local/sbin/restic-backup.sh
 /usr/local/sbin/restic-backup.sh --force
 
-# 2. remove the old triggers
-rm -f /etc/cron.daily/restic-backup*          # laptop / PC
-crontab -l | grep -v restic-backup | crontab - # servers (check the output first!)
-rm -f /root/bin/restic-backup.sh               # optional; or point the cron entry there
+# 2. remove the old triggers -- whichever of these the host actually has
+rm -f /etc/cron.daily/restic-backup*
+crontab -l | grep -v restic-backup | crontab -   # check the output first!
 
 # 3. install the hourly entry, with a minute unique to this host
 install -m 644 restic-backup.cron /etc/cron.d/restic-backup
@@ -489,11 +487,12 @@ $EDITOR /etc/cron.d/restic-backup
 /usr/local/sbin/restic-backup.sh --status
 ```
 
-Then drop `SKIP_IF_UNREACHABLE` from each config and add
-`MAX_BACKUP_AGE_HOURS` (§3.3).
+Then set `MAX_BACKUP_AGE_HOURS` in each config (§3.3): it is what turns a run
+of silent skips into an alert, and it has no useful default for a host whose
+schedule you have just changed.
 
-> **Leaving `/etc/cron.daily` costs you anacron's catch-up**, which on Fedora is
-> what has been backing up the laptop after every boot. `FORCE_AFTER_HOURS`
+> **Leaving `/etc/cron.daily` costs you anacron's catch-up**, which on most
+> distributions is what backs a machine up after every boot. `FORCE_AFTER_HOURS`
 > replaces it — which is why it is worth running the new script on the old
 > schedule for a few days first, and checking `--status` reports a sane
 > `last success`, before you pull the anacron entry.

@@ -220,6 +220,10 @@ RESTIC_PING_URL="https://hc-ping.com/CHANGE-ME"    # treat as a secret -- do not
 #
 # The check runs only AFTER a successful backup, never before, and every error
 # in it is swallowed -- it can neither delay nor block a backup. "" disables it.
+#
+# IF YOU FORKED THIS, point the URL at your own copy. Left as it ships, every
+# host compares itself against an upstream script it will never be deployed and
+# reports drift that no deploy of yours can clear.
 VERSION_CHECK_URL="https://raw.githubusercontent.com/ImanuelBertrand/backup-scripts/refs/heads/main/restic-backup.sh"
 VERSION_CHECK_INTERVAL_HOURS="24"
 

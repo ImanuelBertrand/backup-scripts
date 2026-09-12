@@ -27,7 +27,7 @@ SSH_USER="root"
 # terminal on which to answer a prompt, and "sudo -n" fails immediately instead
 # of hanging -- which deploy.sh reports as a sudo failure, not an unreachable
 # host. On the target:
-#     echo 'imanuel ALL=(root) NOPASSWD: ALL' > /etc/sudoers.d/deploy-restic
+#     echo 'youruser ALL=(root) NOPASSWD: ALL' > /etc/sudoers.d/deploy-restic
 #     chmod 440 /etc/sudoers.d/deploy-restic
 # Where root logs in over ssh directly, this is ignored (nothing to elevate).
 SUDO="sudo -n"
