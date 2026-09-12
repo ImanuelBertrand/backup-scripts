@@ -862,6 +862,38 @@ from BACKUP_PATHS."
 #
 # Pages when the set first appears, whenever it changes, and then at most every
 # NOTIFY_REPEAT_HOURS (0 = never again), matching notify_should_push's policy.
+# What --status says about coverage. A host with a live gap is producing
+# INCOMPLETE backups while .last-success updates normally, so "stale : no" and
+# exit 0 are both true and both beside the point -- without this line the fleet
+# view could not see the condition at all.
+#
+# Reported, NOT folded into the exit code, and the two are different on purpose.
+# The staleness gate exists because a host that is not running cron cannot page:
+# there is no process left to do it. A mount gap is the opposite -- it pages
+# urgently when the set appears, again whenever it changes, then every
+# NOTIFY_REPEAT_HOURS. It is the loudest condition here, so this is a visibility
+# gap, not an alerting one. Making it red would also leave deploy.sh --check red
+# until someone hand-edited the config on that host, which is the same wedged
+# gate that made the old fatal preflight worth removing.
+#
+# Reads what the last due run recorded rather than re-scanning /proc/self/mounts:
+# --status must stay cheap and side-effect-free, and the age says how fresh the
+# answer is.
+mount_gap_status() {
+  local last=0 seen="" n
+  one_file_system_in_use || { printf -- '--one-file-system not in use'; return; }
+  [[ -s "$MOUNT_GAP_FILE" ]] || { printf 'all mounts covered'; return; }
+  read -r last seen < "$MOUNT_GAP_FILE" || true
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  n=$(wc -w <<<"$seen")
+  if (( last > 0 )); then
+    printf '%s SKIPPED by --one-file-system as of %s ago: %s' \
+      "$n" "$(fmt_age $(( NOW - last )))" "$seen"
+  else
+    printf '%s SKIPPED by --one-file-system: %s' "$n" "$seen"
+  fi
+}
+
 mount_gap_should_push() {              # mount_gap_should_push KEY
   (( REPORT_ONLY )) && return 1
   local key="$1" last=0 seen=""
@@ -1092,6 +1124,7 @@ if (( STATUS_ONLY )); then
     "$MIN_INTERVAL_HOURS" "$FORCE_AFTER_HOURS" "$MAX_BACKUP_AGE_HOURS"
   printf 'stale        : %s\n' \
     "$( (( MAX_AGE_SEC > 0 && ALERT_AGE_SEC >= MAX_AGE_SEC )) && echo 'YES -- would alert' || echo no )"
+  printf 'mounts       : %s\n' "$(mount_gap_status)"
   printf 'version      : %s\n' "$(version_status)"
   printf 'decision     : %s\n' "${DUE_REASON:-not due, would skip}"
   # Exit 3, not 0, when this host is past MAX_BACKUP_AGE_HOURS. --status is the
