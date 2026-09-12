@@ -238,15 +238,45 @@ NTFY_TOPIC_HIGH="${NTFY_TOPIC_HIGH:-backups-high}"
 NTFY_TOPIC_LOW="${NTFY_TOPIC_LOW:-}"
 PING_URL="${RESTIC_PING_URL:-$(cfg_peek RESTIC_PING_URL)}"
 
-ping_dms() { [[ -n "$PING_URL" ]] || return 0; curl -fsS -m 10 --retry 3 "$1" >/dev/null 2>&1 || true; }
+# Both senders talk to curl through `-K -` -- a config file on STDIN -- rather
+# than through argv. The ntfy token and the dead-man's-switch URL are secrets
+# (the config says so), and a command line is world-readable for as long as the
+# process lives: `ps auxww` during a 15-second retrying curl hands any local user
+# the token, which is publish rights on the alert topic, and the ping URL, which
+# is the ability to keep the dead-man's switch quiet while a host stops backing
+# up. The body goes the same way -- it carries the tail of restic's stderr.
+#
+# Values are quoted per curl's config syntax: backslash, double quote and the
+# line endings need escaping, and nothing else does.
+curl_cfg_quote() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+ping_dms() {
+  [[ -n "$PING_URL" ]] || return 0
+  {
+    printf 'url = "%s"\n' "$(curl_cfg_quote "$1")"
+    printf 'silent\nshow-error\nfail\nmax-time = 10\nretry = 3\n'
+  } | curl -K - >/dev/null 2>&1 || true
+}
 
 ntfy() {
   local topic="$1" priority="$2" tags="$3" title="$4" body="$5"
   [[ -n "$NTFY_URL" ]] || return 0
-  local args=(-H "Title: $title" -H "Priority: $priority" -H "Tags: $tags")
-  [[ -n "$NTFY_TOKEN" ]] && args+=(-H "Authorization: Bearer $NTFY_TOKEN")
-  curl -fsS -m 15 --retry 3 "${args[@]}" --data-binary "$body" \
-    "$NTFY_URL/$topic" >/dev/null 2>&1 || log "WARN: ntfy send failed"
+  {
+    printf 'url = "%s"\n'              "$(curl_cfg_quote "$NTFY_URL/$topic")"
+    printf 'header = "Title: %s"\n'    "$(curl_cfg_quote "$title")"
+    printf 'header = "Priority: %s"\n' "$(curl_cfg_quote "$priority")"
+    printf 'header = "Tags: %s"\n'     "$(curl_cfg_quote "$tags")"
+    if [[ -n "$NTFY_TOKEN" ]]; then
+      printf 'header = "Authorization: Bearer %s"\n' "$(curl_cfg_quote "$NTFY_TOKEN")"
+    fi
+    printf 'data-binary = "%s"\n'      "$(curl_cfg_quote "$body")"
+    printf 'silent\nshow-error\nfail\nmax-time = 15\nretry = 3\n'
+  } | curl -K - >/dev/null 2>&1 || log "WARN: ntfy send failed"
 }
 
 # Hourly invocation means a stuck host would push 24 urgent notifications a day.
