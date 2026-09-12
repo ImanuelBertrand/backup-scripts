@@ -98,6 +98,30 @@ read_epoch() {                         # file -> epoch on stdout, 0 if unusable
   printf '%s' "$v"
 }
 
+# read_epoch's counterpart, and the ONLY way this script writes a state file.
+# Two properties, both load-bearing:
+#   atomic      -- `> file` truncates before it writes, so losing power inside
+#                  that window leaves a 0-byte .last-success. read_epoch then
+#                  reports 0, the scheduler reads "no successful backup ever",
+#                  ALERT_AGE_SEC falls back to .first-seen, and on a host with
+#                  months of history the next ordinary failure pages "No
+#                  successful backup for 8760h00m".
+#   never fatal -- under `set -e` a failed write (read-only /, full disk) would
+#                  abort the script, and in version_check that runs AFTER the
+#                  backup succeeded: the ERR trap would page "Backup FAILED"
+#                  about a backup that actually worked.
+write_state() {                        # write_state FILE LINE...
+  local f="$1"; shift
+  # 2>/dev/null first: redirections are applied left to right, so a later one
+  # would not yet be in place to swallow the shell's own "cannot create" error.
+  if { printf '%s\n' "$*" > "$f.tmp"; } 2>/dev/null && mv -f "$f.tmp" "$f" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$f.tmp" 2>/dev/null || true
+  log "WARN: could not write $f (state not recorded)"
+  return 0
+}
+
 # Every integer knob goes through here, so the default lives in exactly ONE
 # place: it seeds the value when the config is silent AND it is what a
 # malformed value falls back to. Falling back to the DEFAULT rather than to 0
@@ -244,7 +268,7 @@ version_check() {                      # $1 = "force" to ignore the interval
   fi
   remote_sha="$(sha256_of "$tmp")" || { rm -f "$tmp"; return 0; }
   rm -f "$tmp"
-  printf '%s %s %s\n' "$now" "$remote_sha" "$notified_sha" > "$VERSION_STATE_FILE"
+  write_state "$VERSION_STATE_FILE" "$now" "$remote_sha" "$notified_sha"
 
   [[ "$local_sha" == "$remote_sha" ]] && return 0
 
@@ -260,7 +284,7 @@ Remote: ${remote_sha:0:12}
 Source: $VERSION_CHECK_URL
 
 Nothing was changed -- deploy with ./deploy.sh."
-    printf '%s %s %s\n' "$now" "$remote_sha" "$remote_sha" > "$VERSION_STATE_FILE"
+    write_state "$VERSION_STATE_FILE" "$now" "$remote_sha" "$remote_sha"
   fi
   return 0
 }
@@ -292,7 +316,7 @@ notify_should_push() {
   local hard="$1" now first last hardflag
   now=$(date +%s)
   if [[ ! -s "$NOTIFY_STATE_FILE" ]]; then
-    printf '%s %s %s\n' "$now" "$now" "$hard" > "$NOTIFY_STATE_FILE"
+    write_state "$NOTIFY_STATE_FILE" "$now" "$now" "$hard"
     return 0
   fi
   first=0; last=0; hardflag=0
@@ -305,10 +329,10 @@ notify_should_push() {
   # opposite of every other 0 in this config: re-page on all 24 invocations.
   if (( hard == 1 )) && { (( hardflag == 0 )) \
        || (( NOTIFY_REPEAT_SEC > 0 && now - last >= NOTIFY_REPEAT_SEC )); }; then
-    printf '%s %s 1\n' "$first" "$now" > "$NOTIFY_STATE_FILE"
+    write_state "$NOTIFY_STATE_FILE" "$first" "$now" 1
     return 0
   fi
-  printf '%s %s %s\n' "$first" "$last" "$hardflag" > "$NOTIFY_STATE_FILE"
+  write_state "$NOTIFY_STATE_FILE" "$first" "$last" "$hardflag"
   return 1
 }
 
@@ -604,7 +628,7 @@ if command -v flock >/dev/null 2>&1; then
   fi
 fi
 
-if [[ ! -s "$FIRST_SEEN_FILE" ]]; then printf '%s\n' "$FIRST_SEEN" > "$FIRST_SEEN_FILE"; fi
+if [[ ! -s "$FIRST_SEEN_FILE" ]]; then write_state "$FIRST_SEEN_FILE" "$FIRST_SEEN"; fi
 
 if [[ -z "$DUE_REASON" ]]; then
   log "Not due (last success $(fmt_age "$SCHED_AGE_SEC") ago, window ${BACKUP_WINDOW:-any}); exiting."
@@ -728,7 +752,7 @@ run_step "backup" restic backup \
 # .last-success is written ONLY here, and only after restic returned 0. Every
 # scheduling and staleness decision reads it; a lock-skip or a failed run must
 # never touch it, or a wedged host would look freshly backed up.
-printf '%s\n' "$(date +%s)" > "$LAST_SUCCESS_FILE"
+write_state "$LAST_SUCCESS_FILE" "$(date +%s)"
 rm -f "$NOTIFY_STATE_FILE"            # failure streak is over; next failure pages again
 
 log "Backup complete."
