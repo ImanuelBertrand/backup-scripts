@@ -589,9 +589,13 @@ $(printf '%s' "$output" | tail -c 1500)"
 # 9>&- keeps the lock fd out of the child. Anything a pre-backup hook leaves
 # running in the background would otherwise inherit the flock and hold it for
 # good: every later run would report "another run has held the lock for Nh",
-# page once past MAX_BACKUP_AGE_HOURS, and never back up again. The pipe is the
-# other half of that -- with a captured $( ) the surviving child also had to
-# close stdout before this function could return.
+# page once past MAX_BACKUP_AGE_HOURS, and never back up again.
+#
+# It is needed on BOTH halves of the pipeline: a redirection before the pipe
+# applies only to the first element, so a tee that inherited fd 9 held the lock
+# just as effectively as the hook's own orphan -- and outlived the run that
+# started it, since a background hook holding the pipe open keeps tee alive
+# after this script is killed.
 run_step() {
   local stage="$1"; shift
   local tmp rc out
@@ -599,7 +603,7 @@ run_step() {
   tmp="$(mktemp 2>/dev/null)" || tmp=""      # 0600; /tmp is excluded from backups
   set +e
   if [[ -n "$tmp" ]]; then
-    "$@" 9>&- 2>&1 | tee "$tmp"
+    "$@" 9>&- 2>&1 | tee "$tmp" 9>&-
     rc=${PIPESTATUS[0]}
   else
     "$@" 9>&- 2>&1
