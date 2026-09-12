@@ -96,6 +96,28 @@ SKIP_IF_METERED="true"
 # only tests that the WG route is up, not auth. Point at the rest-server root.
 REST_HEALTH_URL="http://10.0.0.2:8000/"
 
+# ---- WireGuard self-heal (optional) -----------------------------------------
+# If the probe above fails, bounce the tunnel once and try again. This targets
+# the tunnel that is "up" but dead: the peer's endpoint moved (dynamic DNS, new
+# NAT mapping) and the kernel keeps talking to the old address forever.
+#
+# Name the interface to enable it; "" leaves the tunnel alone. Requires root.
+# The script prefers `systemctl restart wg-quick@<if>` when that unit is active
+# and only falls back to `wg-quick down/up` otherwise -- going behind systemd's
+# back would leave the unit thinking the interface is still up. It also refuses
+# to touch the tunnel when there is no default route: the host is simply offline,
+# `wg-quick up` could not resolve the endpoint, and a failed up() after a
+# successful down() leaves you worse off than before.
+WG_INTERFACE=""                                    # e.g. "wg0"
+
+# Escape hatch for tunnels managed by something else (NetworkManager, a custom
+# unit). If set, this runs INSTEAD of the built-in logic. WG_INTERFACE is then
+# only a label.
+# WG_RESTART_CMD="nmcli connection up wg0"
+
+# Seconds to wait after a restart before re-probing.
+# WG_SETTLE_SECS="5"
+
 # ---- Failure notifications (ntfy) -- failure-only; success is silent --------
 # Your ntfy base URL (self-hosted or https://ntfy.sh). No trailing slash.
 NTFY_URL="https://ntfy.example.com"

@@ -81,13 +81,18 @@ SKIP_IF_METERED="${SKIP_IF_METERED:-false}"
 MAX_BACKUP_AGE_HOURS="${MAX_BACKUP_AGE_HOURS:-36}"   # 0 = never hard-fail on age
 NOTIFY_REPEAT_HOURS="${NOTIFY_REPEAT_HOURS:-12}"     # re-page interval while stale
 
+# WireGuard self-heal: bounce the tunnel once if the backend is unreachable.
+WG_INTERFACE="${WG_INTERFACE:-}"                     # "" = never touch the tunnel
+WG_RESTART_CMD="${WG_RESTART_CMD:-}"                 # overrides the built-in logic
+WG_SETTLE_SECS="${WG_SETTLE_SECS:-5}"
+
 if declare -p SKIP_IF_UNREACHABLE &>/dev/null; then
   log "WARN: SKIP_IF_UNREACHABLE is obsolete and ignored -- an unreachable backend is"
   log "WARN: now always a silent skip, and MAX_BACKUP_AGE_HOURS decides when that"
   log "WARN: becomes a failure. Delete it from $CONFIG_DIR/config."
 fi
 
-for _v in MAX_BACKUP_AGE_HOURS NOTIFY_REPEAT_HOURS; do
+for _v in MAX_BACKUP_AGE_HOURS NOTIFY_REPEAT_HOURS WG_SETTLE_SECS; do
   declare -n _r="$_v"
   if [[ ! "$_r" =~ ^[0-9]+$ ]]; then log "WARN: $_v='$_r' is not an integer; using 0"; _r=0; fi
 done
@@ -374,11 +379,60 @@ if [[ "$SKIP_IF_METERED" == "true" ]] && link_is_metered; then
 fi
 
 # ---- Backend reachable? (10.0.0.2 is routable only through WireGuard) ----
-# Unreachable is a SILENT skip whatever the host is: stale_exit decides, from
-# the age of the last success, whether this particular silence is a failure.
-if [[ -n "${REST_HEALTH_URL:-}" ]] && ! curl -sS -o /dev/null -m 8 "$REST_HEALTH_URL"; then
-  log "Backend $REST_HEALTH_URL unreachable (WG down?)."
-  stale_exit "backend unreachable (WireGuard down?)"
+# The classic WireGuard failure is a tunnel that is "up" but dead: the peer's
+# endpoint moved (dynamic DNS, new NAT mapping) and the kernel keeps talking to
+# the old address forever. Bouncing the interface re-resolves and re-punches.
+# Split-tunnel (AllowedIPs = 10.0.0.0/24) keeps the blast radius at zero.
+backend_reachable() {
+  [[ -n "${REST_HEALTH_URL:-}" ]] || return 0
+  curl -sS -o /dev/null -m 8 "$REST_HEALTH_URL" 2>/dev/null
+}
+
+wg_bounce() {
+  if [[ -n "$WG_RESTART_CMD" ]]; then
+    log "WG: running WG_RESTART_CMD"
+    if ! bash -c "$WG_RESTART_CMD"; then log "WG: WG_RESTART_CMD failed."; return 1; fi
+    sleep "$WG_SETTLE_SECS"; return 0
+  fi
+  [[ -n "$WG_INTERFACE" ]] || return 1
+  # No default route means the host is simply offline: `wg-quick up` could not
+  # resolve the endpoint anyway, and a failed up() after a successful down()
+  # leaves the tunnel DOWN -- strictly worse than what we started with.
+  if ! ip route show default 2>/dev/null | grep -q .; then
+    log "WG: no default route -- host is offline; leaving $WG_INTERFACE alone."
+    return 1
+  fi
+  # Never run wg-quick behind systemd's back: it would leave the unit thinking
+  # the interface is still up.
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "wg-quick@$WG_INTERFACE"; then
+    log "WG: restarting wg-quick@$WG_INTERFACE (systemd-managed)"
+    if ! systemctl restart "wg-quick@$WG_INTERFACE"; then log "WG: systemctl restart failed."; return 1; fi
+  elif command -v wg-quick >/dev/null 2>&1; then
+    log "WG: bouncing $WG_INTERFACE with wg-quick"
+    wg-quick down "$WG_INTERFACE" >/dev/null 2>&1 || true      # may already be down
+    if ! wg-quick up "$WG_INTERFACE"; then
+      log "WG: 'wg-quick up $WG_INTERFACE' FAILED -- the tunnel is now DOWN."
+      return 1
+    fi
+  else
+    log "WG: neither a wg-quick@$WG_INTERFACE unit nor a wg-quick binary; cannot restart."
+    return 1
+  fi
+  sleep "$WG_SETTLE_SECS"
+  return 0
+}
+
+if ! backend_reachable; then
+  log "Backend ${REST_HEALTH_URL:-} unreachable (WG down?)."
+  if [[ -z "$WG_INTERFACE$WG_RESTART_CMD" ]]; then
+    stale_exit "backend unreachable (WireGuard down?)"
+  elif ! wg_bounce; then
+    stale_exit "backend unreachable; WireGuard restart skipped or failed"
+  elif ! backend_reachable; then
+    stale_exit "backend still unreachable after restarting WireGuard"
+  else
+    log "Backend reachable again after restarting the tunnel."
+  fi
 fi
 
 ping_dms "$PING_URL/start"

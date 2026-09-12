@@ -124,6 +124,30 @@ Only backup traffic goes through the tunnel. ntfy and healthchecks keep using
 the normal internet, so **alerts still reach you when the tunnel is down** —
 which is exactly when you need them.
 
+### 2.1 Self-heal: bouncing a tunnel that is up but dead
+
+If the reachability probe fails and `WG_INTERFACE` is set, the script bounces the
+tunnel once and probes again. This targets the tunnel that is "up" but dead: the
+peer's endpoint moved (dynamic DNS, a new NAT mapping) and the kernel goes on
+talking to the old address indefinitely. Split-tunnel `AllowedIPs = 10.0.0.0/24`
+keeps the blast radius at zero — bouncing the interface cannot drop your SSH
+session.
+
+Three guards worth knowing about:
+
+- It prefers `systemctl restart wg-quick@<if>` whenever that unit is active, and
+  only falls back to `wg-quick down/up`. Running `wg-quick` behind systemd's back
+  leaves the unit convinced the interface is still up.
+- With **no default route** it does not touch the tunnel at all. The host is
+  simply offline; `wg-quick up` could not resolve the endpoint anyway, and a
+  failed `up` after a successful `down` leaves you worse off than before.
+- If something else owns the tunnel (NetworkManager, a bespoke unit), set
+  `WG_RESTART_CMD` instead — it replaces the built-in logic entirely.
+
+A host that needs a nightly bounce has a different problem underneath (endpoint
+DNS TTL, or a NAT timeout shorter than `PersistentKeepalive`). Grep the log for
+`WG:` occasionally rather than letting the self-heal paper over it forever.
+
 ---
 
 ## 3. Client setup
@@ -176,6 +200,7 @@ Then set the per-host behaviour:
 |---|---|---|
 | `SKIP_IF_METERED` | `"false"` | `"true"` |
 | `MAX_BACKUP_AGE_HOURS` | `"36"` — one missed night is fine, two is not | `"168"` — a week away from the tunnel is normal |
+| `WG_INTERFACE` | `"wg0"` if the tunnel is local to this host | `"wg0"` |
 | `EXTRA_BACKUP_ARGS` | `(--one-file-system)` | `(--one-file-system)` |
 
 > **`SKIP_IF_UNREACHABLE` is gone.** An unreachable backend is now *always* a
@@ -198,6 +223,7 @@ NTFY_TOPIC_HIGH="backups-high"
 NTFY_TOKEN="…"                               # "" if the topic is open
 RESTIC_PING_URL="https://hc-ping.com/…"      # healthchecks.io or self-hosted
 REST_HEALTH_URL="http://10.0.0.2:8000/"      # reachability probe = "is WG up?"
+WG_INTERFACE="wg0"                           # "" to never touch the tunnel
 ```
 
 `config` holds three secrets (REST password, ntfy token, ping URL). Keep it
@@ -453,6 +479,7 @@ Then let a real run repair it, or delete `.last-success` to reset.
 | Backup skipped, no alert | Metered link or tunnel down, and the last success is still within `MAX_BACKUP_AGE_HOURS`. By design; no ping is sent. |
 | `STALE: no successful backup for …` | The hard fail. The host is alive but hasn't backed up in `MAX_BACKUP_AGE_HOURS`; the log line above it says which skip path it took. |
 | `notification suppressed (already alerted…)` | Throttling, not a new problem. The original push already went out. |
+| `WG: 'wg-quick up wg0' FAILED — the tunnel is now DOWN` | The bounce brought the tunnel down and could not bring it back (endpoint unresolvable). Fix the tunnel by hand; the script won't retry until the next run. |
 | Dump fails, whole backup aborts | Intended. Fix the dump — don't disable the check. |
 | `no mariadb-dump/pg_dumpall in container` | `DOCKER_AUTO` on a SQLite container. Use `SQLITE_FILES` with the host path, or the hook. |
 | Alert fires but no desktop popup | `notify-send` from a root systemd unit can't reach your session. The ntfy message is the real channel. |
