@@ -219,13 +219,39 @@ for h in "${HOSTS[@]}"; do
   addr="$(addr_of "$h")"
   printf '\n=== %s ===\n' "$h"
   ok=1
-  [[ "${PLAN[$h]}" == *script*   ]] && { push "$SRC_DIR/restic-backup.sh" "$SBIN_PATH" 755        || ok=0; }
-  [[ "${PLAN[$h]}" == *excludes* ]] && { push "$SRC_DIR/excludes" "$CONFIG_DIR/excludes" 644 700  || ok=0; }
-  [[ "${PLAN[$h]}" == *cron*     ]] && { push "${CRONTMP[$h]}" "$CRON_PATH" 644                   || ok=0; }
+  # Ordered, and each step gated on the one before it. The three pushes used to
+  # run unconditionally, recording ok=0 without acting on it, so a script push
+  # that failed -- a full disk, a read-only /usr, a connection dropped mid-run --
+  # was still followed by the cron entry. That leaves an hourly root job pointing
+  # at a script that is not there: the host backs up nothing, and since the
+  # staleness alerting only ever runs FROM that job, neither the host nor this
+  # tool ever says so. It is the same silent-no-backup state the NO_CRON warning
+  # exists to prevent, reached through a different door.
+  #
+  # Cron therefore goes last and only if everything it depends on landed.
+  if [[ "${PLAN[$h]}" == *script* ]]; then
+    push "$SRC_DIR/restic-backup.sh" "$SBIN_PATH" 755 \
+      || { ok=0; echo "  FAILED to push $SBIN_PATH"; }
+  fi
+  if (( ok )) && [[ "${PLAN[$h]}" == *excludes* ]]; then
+    push "$SRC_DIR/excludes" "$CONFIG_DIR/excludes" 644 700 \
+      || { ok=0; echo "  FAILED to push $CONFIG_DIR/excludes"; }
+  fi
+  if (( ok )) && [[ "${PLAN[$h]}" == *cron* ]]; then
+    push "${CRONTMP[$h]}" "$CRON_PATH" 644 \
+      || { ok=0; echo "  FAILED to push $CRON_PATH -- this host has no schedule"; }
+  fi
   if (( ok )); then
-    ssh "${SSH_OPTS[@]}" "$addr" "'$SBIN_PATH' --status" || { echo "  (--status failed)"; rc=1; }
+    ssh -n "${SSH_OPTS[@]}" "$addr" "$(rq "$SBIN_PATH") --status" \
+      || { echo "  (--status failed)"; rc=1; }
   else
-    echo "  FAILED"; rc=1
+    rc=1
+    if [[ "${PLAN[$h]}" == *cron* ]]; then
+      echo "  Skipped the remaining steps, INCLUDING the cron entry -- deliberately:"
+      echo "  a schedule without a working script is a host that silently never backs up."
+    else
+      echo "  Skipped the remaining steps for this host."
+    fi
   fi
 done
 
