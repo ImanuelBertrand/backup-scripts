@@ -1,0 +1,94 @@
+# =============================================================================
+# restic-maintenance.sh -- maintenance host config  (SAMPLE / template)
+# -----------------------------------------------------------------------------
+#     install -m 600 maintenance.config.sample ~/.config/restic-maintenance/config
+#     $EDITOR ~/.config/restic-maintenance/config
+#
+# THIS FILE IS EXECUTED as root, and it holds MAINT_PASSWORD and the ntfy token
+# on the one host that can decrypt every client's repository. The script refuses
+# to start if it, or any directory above it, is group- or world-writable.
+# 0600, root-owned, and never committed.
+#
+# The encryption passwords stay OUT of this file, one per client, beside it:
+#     $CONFIG_DIR/encryption_pw_<name>      (0600)
+# They are secrets rather than settings, and restic reads them from a file.
+#
+# deploy.sh pushes to CLIENTS only. Nothing here is deployed; this host is
+# hand-managed on purpose -- it is the only one with delete rights.
+# =============================================================================
+
+# ---- The delete-capable backend ---------------------------------------------
+# The SECOND rest-server: LAN-only, no --append-only, and behind its own
+# htpasswd, so a leaked client backup credential cannot authenticate here.
+# Clients never see this URL.
+#
+# The per-client repo is "$REST_MAINT_URL/<client>/" and the HTTP Basic user is
+# the client name, exactly as with the client-facing server.
+REST_MAINT_URL="http://192.0.2.10:8001"     # REQUIRED -- no trailing slash
+MAINT_PASSWORD="CHANGE-ME"                  # REQUIRED -- SECRET, htpasswd password
+
+# ---- Which repositories to maintain -----------------------------------------
+# One entry per client, and the name must match BOTH the first path segment of
+# that client's repository URL and its $CONFIG_DIR/encryption_pw_<name> file.
+#
+# Names also seed the prune stagger: each client's offset is derived from its
+# name, so they come due on different days rather than all on one night.
+CLIENTS=(
+  laptop
+  srv01
+  srv02
+)
+
+# ---- Retention ---------------------------------------------------------------
+# Passed to `restic forget` verbatim. MUST be an array: as a plain string the
+# whole policy collapses into a single restic argument.
+#
+# --group-by host is NOT here on purpose -- it lives in the script, because a
+# per-client override below replaces this array wholesale and would otherwise
+# drop it silently on exactly one client. See README §6.
+FORGET_POLICY_DEFAULT=(--keep-daily 7 --keep-weekly 4 --keep-monthly 12 --keep-yearly 3)
+
+# Per-client override, optional. Replaces the whole policy for that client.
+# declare -A FORGET_POLICY_BY_CLIENT=(
+#   [laptop]="--keep-daily 14 --keep-weekly 8"
+# )
+
+# How often prune is allowed to run, per client. Prune repacks every partially
+# used pack file, so it is by far the most expensive step; each client carries
+# its own timestamp under $CONFIG_DIR/state/ and comes due independently.
+# Must be >= 1. `--prune` on the command line forces it for every client.
+# PRUNE_MIN_INTERVAL_DAYS="7"
+
+# ---- Verification -------------------------------------------------------------
+# `restic check` validates structure but does NOT read pack data by default.
+# Set a percentage and the script converts it to restic's n/t form itself,
+# rotating the slice by day-of-year so the whole repo is covered every 20 runs.
+# restic's own "x%" re-samples at random each run and guarantees no coverage.
+# CHECK_READ_DATA_SUBSET="5%"
+
+# After check, one small file is restored out of `latest` and asserted to have
+# materialised -- structure being valid is not proof that repo, password,
+# decrypt and restore path still turn into real bytes.
+# RESTORE_TEST_ROOT="/tmp/restic-restore-test"   # wiped from an EXIT trap
+# RESTORE_TEST_PATH="/etc/hostname"              # must exist in every snapshot
+# declare -A RESTORE_TEST_PATH_BY_CLIENT=(
+#   [srv02]="/etc/os-release"
+# )
+
+# How long to wait for a repo lock a client is holding. Prune takes the lock
+# for the whole run, so schedule maintenance away from the client window.
+# LOCK_WAIT="15m"
+
+# ---- Alerting ----------------------------------------------------------------
+# Same ntfy setup as the clients. Left empty, the script logs and stays silent.
+# NTFY_URL="https://ntfy.example.com"
+# NTFY_TOPIC_HIGH="backups-high"
+# NTFY_TOKEN="CHANGE-ME"                       # SECRET
+
+# Reachability probe for the maintenance backend. Checked once, before any
+# client is touched, so an unreachable server is one alert and not one per repo.
+# REST_HEALTH_URL="http://192.0.2.10:8001/"
+
+# Dead-man's switch for the maintenance run itself. /start, /fail and the bare
+# URL are pinged, exactly as on the clients.
+# RESTIC_PING_URL="https://hc-ping.com/CHANGE-ME"     # SECRET

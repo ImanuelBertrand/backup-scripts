@@ -109,7 +109,7 @@ require_trusted "$CONFIG_DIR/config" "the maintenance config"
 # shellcheck disable=SC1091
 source "$CONFIG_DIR/config"
 #
-# See config.sample for the full, documented set of variables. Summary:
+# See maintenance.config.sample for the full, documented set. Summary:
 #   REST_MAINT_URL, MAINT_PASSWORD, CLIENTS, FORGET_POLICY_DEFAULT   REQUIRED
 #   LOCK_WAIT, RESTORE_TEST_ROOT, RESTORE_TEST_PATH, CHECK_READ_DATA_SUBSET,
 #   PRUNE_MIN_INTERVAL_DAYS, REST_HEALTH_URL, NTFY_*, RESTIC_PING_URL  optional

@@ -42,6 +42,8 @@ backup**, not the reason for the skip.
 | `deploy.sh` | admin machine (stays in the repo) | Pushes the files above to every host. Clients never pull. |
 | `deploy.conf.sample` | admin machine, → `deploy.conf` | Your host list, paths, and per-host cron minute. Gitignored. |
 | `docker-compose.yml` | backup host | The rest-server. |
+| `restic-maintenance.sh` | maintenance host, e.g. `/usr/local/sbin/` | Retention, prune, check and a restore smoke-test. Never runs on a client. |
+| `maintenance.config.sample` | maintenance host, → `~/.config/restic-maintenance/config` | Its settings **and secrets**. Hand-managed; `deploy.sh` never touches it. |
 
 ## Prerequisites
 
@@ -601,9 +603,9 @@ restore proves that repo, password, decrypt and restore path still turn into
 real bytes.
 
 Config is hand-managed on that host, in
-`$HOME/.config/restic-maintenance/config`, with each client's repo encryption
-password beside it as `encryption_pw_<name>`. `deploy.sh` pushes to clients
-only and never touches any of it.
+`$HOME/.config/restic-maintenance/config` (start from `maintenance.config.sample`),
+with each client's repo encryption password beside it as `encryption_pw_<name>`.
+`deploy.sh` pushes to clients only and never touches any of it.
 
 Four things to be deliberate about:
 
