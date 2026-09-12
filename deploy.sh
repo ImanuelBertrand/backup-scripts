@@ -97,6 +97,32 @@ warn_prereqs() {
   printf '  Each of these installs cleanly and then backs nothing up.\n' >&2
 }
 
+# Both of these produce a host with NO schedule, which is the one failure state
+# neither this tool nor the host itself can report afterwards -- the staleness
+# alerting only ever runs from the cron job that is missing.
+#
+# cron.d files are parsed whole: a single malformed line makes cronie reject the
+# entire file. render_cron splices the minute in with `awk -v`, which also
+# interprets backslash escapes, so an unvalidated value can inject a line as
+# easily as break one. And a filename containing a dot is silently ignored --
+# restic-backup.cron documents that, and nothing enforced it.
+for h in "${HOSTS[@]}"; do
+  m="${CRON_MINUTE[$h]:-}"
+  [[ -z "$m" ]] && continue
+  if ! [[ "$m" =~ ^[0-9]{1,2}$ ]] || (( 10#$m > 59 )); then
+    echo "FATAL: CRON_MINUTE[$h]='$m' in $CONF must be a whole number 0-59." >&2
+    echo "  Anything else makes cronie reject the whole file, and the host then" >&2
+    echo "  has no schedule at all -- with nothing to report that it hasn't." >&2
+    exit 1
+  fi
+done
+if [[ "$(dirname "$CRON_PATH")" == /etc/cron.d && "$(basename "$CRON_PATH")" == *.* ]]; then
+  echo "FATAL: CRON_PATH ($CRON_PATH) has a dot in its filename." >&2
+  echo "  cronie silently ignores /etc/cron.d entries whose names contain one, so" >&2
+  echo "  the file would deploy successfully and never run." >&2
+  exit 1
+fi
+
 addr_of() { [[ "$1" == *@* ]] && printf '%s' "$1" || printf '%s@%s' "$SSH_USER" "$1"; }
 sha_of()  { sha256sum "$1" | awk '{print $1}'; }
 
