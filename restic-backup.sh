@@ -1343,7 +1343,11 @@ if _have_db_config || [[ -x "$PRE_BACKUP_HOOK" ]]; then
   # the chmod land on the target, so refuse one outright; -m 700 keeps the
   # directory from existing world-readable even for the instant between mkdir
   # and chmod (the chmod stays, for a directory that already exists).
-  [[ ! -L "$DUMP_DIR" ]] || { echo "FATAL: \$DUMP_DIR ($DUMP_DIR) is a symlink" >&2; exit 1; }
+  # preflight_fail, not a bare exit: this is as fatal as any config guard above,
+  # and a bare `exit` here reaches nobody -- it does not fire the ERR trap, the
+  # run never gets far enough to touch the last-backup stamp, and the host would
+  # simply fail silently every hour until the dead-man's switch noticed.
+  [[ ! -L "$DUMP_DIR" ]] || preflight_fail "\$DUMP_DIR ($DUMP_DIR) is a symlink"
   mkdir -p -m 700 "$DUMP_DIR"; chmod 700 "$DUMP_DIR"
   # EXIT alone is not enough: a non-interactive bash killed by an untrapped
   # SIGTERM -- a reboot, `systemctl stop`, the OOM killer -- dies without running
