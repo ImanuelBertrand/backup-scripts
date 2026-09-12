@@ -807,7 +807,11 @@ from BACKUP_PATHS."
 # Every local mount that --one-file-system will silently decline to cross.
 check_one_file_system_coverage() {
   one_file_system_in_use || return 0
-  local -a gaps=() ex_prefixes=()
+  # Two parallel arrays, not one "path (fstype)" string per gap: mount targets
+  # can contain spaces (/proc/self/mounts escapes them as \040, and the
+  # printf '%b' below turns that back into a real space), so the packed form
+  # could not be taken apart again to build the UNBACKED_MOUNTS suggestion.
+  local -a gap_targets=() gap_labels=() ex_prefixes=()
   local target fstype p root best t_dev p_dev ex covered pseudo
   mapfile -t ex_prefixes < <(excluded_prefixes)
   pseudo=" ${PSEUDO_FSTYPES//[$'\n\t']/ } "          # whole-word matching, not substring
@@ -843,21 +847,24 @@ check_one_file_system_coverage() {
     p_dev=$(stat -c %d "$best"   2>/dev/null) || continue
     [[ "$t_dev" == "$p_dev" ]] && continue
 
-    gaps+=("$target ($fstype)")
+    gap_targets+=("$target")
+    gap_labels+=("$target  ($fstype)")
   done < /proc/self/mounts
 
-  (( ${#gaps[@]} )) || return 0
+  (( ${#gap_targets[@]} )) || return 0
+  # %q so a path with a space is pasteable as ONE array element.
+  local suggestion; suggestion="$(printf '%q ' "${gap_targets[@]}")"
   preflight_fail \
 "--one-file-system is in EXTRA_BACKUP_ARGS, and these mounted filesystems are
 inside the backup set but will be silently skipped:
 
-$(printf '  %s\n' "${gaps[@]}")
+$(printf '  %s\n' "${gap_labels[@]}")
 
 Each one would be missing from every snapshot, with no error at restore time.
 Either add it to BACKUP_PATHS in $CONFIG_DIR/config, exclude it in
 $EXCLUDE_FILE, or -- if it really should not be backed up -- acknowledge it:
 
-  UNBACKED_MOUNTS=($(printf '%s ' "${gaps[@]%% *}" | sed 's/ $//'))"
+  UNBACKED_MOUNTS=(${suggestion% })"
 }
 
 # ============================================================================
