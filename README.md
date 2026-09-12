@@ -369,6 +369,15 @@ Because 24 invocations a day must not mean 24 pushes, notification is throttled:
 
 State lives in `$CONFIG_DIR/.notify-state` and is deleted on every success.
 
+A failure *before* the config is loaded — a file that will not parse, wrong
+ownership, a missing `BACKUP_PATHS` — is reported the same way. The ntfy and
+ping settings needed to say so are read out of the config as plain text, without
+executing it, so a config broken by an interrupted edit still pages instead of
+dying into `logger` with `MAILTO=""` and taking the staleness alarm with it.
+These count as hard failures from the first occurrence (a broken config does not
+heal itself) but go through the same throttle, so it is one page, then
+`NOTIFY_REPEAT_HOURS`.
+
 ### 4.4 Inspect the decision
 
 `--status` prints what the script would do and changes nothing:

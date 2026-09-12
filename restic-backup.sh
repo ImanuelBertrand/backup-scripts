@@ -157,15 +157,13 @@ path_is_trusted() {                    # path -> 0 if nobody else can write it
 require_trusted() {                    # require_trusted PATH DESCRIPTION
   local p="$1" desc="$2" d
   if ! path_is_trusted "$p"; then
-    echo "FATAL: $desc ($p) must be owned by root or UID $EUID and not group/world-writable" >&2
-    echo "FATAL: it is executed as UID $EUID; anyone who can write it owns this host." >&2
-    exit 1
+    preflight_fail "$desc ($p) must be owned by root or UID $EUID and not group/world-writable.
+It is executed as UID $EUID, so anyone who can write it owns this host."
   fi
   d="$(dirname "$(readlink -f "$p")")"
   while :; do
     if ! path_is_trusted "$d"; then
-      echo "FATAL: $desc ($p) sits under a directory anyone can write ($d)" >&2
-      exit 1
+      preflight_fail "$desc ($p) sits under a directory anyone can write ($d)"
     fi
     [[ "$d" == / ]] && break
     d="$(dirname "$d")"
@@ -192,8 +190,133 @@ int_cfg() {                            # int_cfg NAME DEFAULT
 
 # ---- Load per-host config ----
 CONFIG_DIR="${RESTIC_CONFIG_DIR:-$HOME/.config/restic}"
-[[ -f "$CONFIG_DIR/config" ]] || { echo "FATAL: missing $CONFIG_DIR/config" >&2; exit 1; }
+
+# ============================================================================
+#  NOTIFICATION BOOTSTRAP  --  built BEFORE the config is loaded, on purpose.
+#
+#  Everything that can go wrong while loading the config used to be completely
+#  silent: the ntfy and DMS settings live IN that config, so a file that would
+#  not parse -- a half-finished hand-edit, an interrupted deploy -- died with a
+#  bash error into `logger`, and MAILTO="" in the cron file ended it there. No
+#  push, no /fail ping, and not even the local staleness alarm, which is further
+#  down still. The host stopped backing up and nothing anywhere said a word;
+#  only the external dead-man's switch noticed, a grace period later.
+#
+#  So the senders, the throttle and its state files are set up here, seeded from
+#  a pre-parse that reads the config as TEXT and never executes it, and an ERR
+#  trap is armed before the config is touched at all. Everything below re-reads
+#  the same values from the real config once sourcing has succeeded.
+# ============================================================================
+
+# State. Cheap, local, and the only thing that survives a reboot: .last-success
+# is what every scheduling and staleness decision is measured against.
+LAST_SUCCESS_FILE="$CONFIG_DIR/.last-success"
+FIRST_SEEN_FILE="$CONFIG_DIR/.first-seen"
+NOTIFY_STATE_FILE="$CONFIG_DIR/.notify-state"
+VERSION_STATE_FILE="$CONFIG_DIR/.version-state"
+LOCK_FILE="$CONFIG_DIR/.lock"
+WG_BOUNCE_FILE="$CONFIG_DIR/.wg-bounce"
+ALERT_AGE_SEC=-1                       # set for real below; safe default for the ERR trap
+NOTIFY_REPEAT_SEC=43200                # 12h, the default; recomputed from the config below
+
+# Pull ONE literal setting out of the config without running it. Deliberately
+# narrow: only a single-quoted or double-quoted literal on its own line, with no
+# expansion or substitution in it, is accepted -- anything else needs a shell,
+# which is precisely what we cannot have yet. A miss just leaves the value empty
+# and costs us the notification we were trying to salvage, never more than that.
+cfg_peek() {                           # cfg_peek NAME -> literal value on stdout
+  [[ -r "$CONFIG_DIR/config" ]] || return 0
+  sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1=\"([^\"\$\`]*)\".*/\2/p;
+             s/^[[:space:]]*(export[[:space:]]+)?$1='([^'\$\`]*)'.*/\2/p" \
+      "$CONFIG_DIR/config" 2>/dev/null | tail -n1
+}
+
+NTFY_URL="${NTFY_URL:-$(cfg_peek NTFY_URL)}"
+NTFY_TOKEN="${NTFY_TOKEN:-$(cfg_peek NTFY_TOKEN)}"
+NTFY_TOPIC_HIGH="${NTFY_TOPIC_HIGH:-$(cfg_peek NTFY_TOPIC_HIGH)}"
+NTFY_TOPIC_HIGH="${NTFY_TOPIC_HIGH:-backups-high}"
+NTFY_TOPIC_LOW="${NTFY_TOPIC_LOW:-}"
+PING_URL="${RESTIC_PING_URL:-$(cfg_peek RESTIC_PING_URL)}"
+
+ping_dms() { [[ -n "$PING_URL" ]] || return 0; curl -fsS -m 10 --retry 3 "$1" >/dev/null 2>&1 || true; }
+
+ntfy() {
+  local topic="$1" priority="$2" tags="$3" title="$4" body="$5"
+  [[ -n "$NTFY_URL" ]] || return 0
+  local args=(-H "Title: $title" -H "Priority: $priority" -H "Tags: $tags")
+  [[ -n "$NTFY_TOKEN" ]] && args+=(-H "Authorization: Bearer $NTFY_TOKEN")
+  curl -fsS -m 15 --retry 3 "${args[@]}" --data-binary "$body" \
+    "$NTFY_URL/$topic" >/dev/null 2>&1 || log "WARN: ntfy send failed"
+}
+
+# Hourly invocation means a stuck host would push 24 urgent notifications a day.
+# Policy, keyed off $NOTIFY_STATE_FILE ("<first> <last> <hard>", removed on every
+# success):
+#   - first failure after a success  -> always push (breakage is actionable NOW)
+#   - later failures, still under MAX_BACKUP_AGE -> log + DMS only
+#   - crossing MAX_BACKUP_AGE        -> push once more (escalation)
+#   - beyond that                    -> push at most every NOTIFY_REPEAT_HOURS,
+#                                       or never again if that is 0
+# Returns 0 if this event should be pushed. Always records the attempt.
+notify_should_push() {
+  local hard="$1" now first last hardflag
+  now=$(date +%s)
+  if [[ ! -s "$NOTIFY_STATE_FILE" ]]; then
+    write_state "$NOTIFY_STATE_FILE" "$now" "$now" "$hard"
+    return 0
+  fi
+  first=0; last=0; hardflag=0
+  read -r first last hardflag < "$NOTIFY_STATE_FILE" || true
+  [[ "$first"    =~ ^[0-9]+$ ]] || first="$now"
+  [[ "$last"     =~ ^[0-9]+$ ]] || last=0
+  [[ "$hardflag" =~ ^[01]$   ]] || hardflag=0
+  # NOTIFY_REPEAT_SEC == 0 must mean "escalate once, then stay quiet". Without
+  # the guard the comparison is trivially true and 0 would do the exact
+  # opposite of every other 0 in this config: re-page on all 24 invocations.
+  if (( hard == 1 )) && { (( hardflag == 0 )) \
+       || (( NOTIFY_REPEAT_SEC > 0 && now - last >= NOTIFY_REPEAT_SEC )); }; then
+    write_state "$NOTIFY_STATE_FILE" "$first" "$now" 1
+    return 0
+  fi
+  write_state "$NOTIFY_STATE_FILE" "$first" "$last" "$hardflag"
+  return 1
+}
+
+# The exit for every "this host cannot even attempt a backup" condition. Treated
+# as hard from the first occurrence -- a broken config does not heal itself, and
+# unlike an ordinary failure there is no next stage that might still succeed --
+# but routed through the same throttle, so it pages once and then respects
+# NOTIFY_REPEAT_HOURS instead of 24 times a day.
+preflight_fail() {                     # preflight_fail MESSAGE
+  log "FATAL: $1"
+  echo "FATAL: $1" >&2
+  ping_dms "$PING_URL/fail"
+  if notify_should_push 1; then
+    ntfy "$NTFY_TOPIC_HIGH" urgent rotating_light \
+      "Backup BROKEN on $(hostname) (preflight)" \
+"Host: $(hostname)
+This host could not start a backup at all:
+
+$1
+
+Nothing was backed up, and nothing will be until this is fixed."
+  else
+    log "NOTICE: notification suppressed (already alerted)"
+  fi
+  exit 1
+}
+
+# Armed here so that an unexpected failure in the config itself -- a command in
+# it that fails under set -e, say -- is reported rather than swallowed. Replaced
+# by the full ERR trap once notify_failure and the age arithmetic exist.
+trap 'rc=$?; preflight_fail "unexpected failure while loading the config (line $LINENO, exit $rc)"' ERR
+
+[[ -f "$CONFIG_DIR/config" ]] || preflight_fail "missing $CONFIG_DIR/config"
 require_trusted "$CONFIG_DIR/config" "the config"
+# Parse before executing: `source` on a half-written file aborts the shell part
+# way through, leaving some settings applied and the rest at their defaults.
+bash -n "$CONFIG_DIR/config" 2>/dev/null \
+  || preflight_fail "$CONFIG_DIR/config is not valid bash (deploy or edit interrupted?)"
 # shellcheck disable=SC1091
 source "$CONFIG_DIR/config"
 # NOTE: restic authenticates to rest-server via HTTP Basic Auth on EVERY request --
@@ -201,8 +324,8 @@ source "$CONFIG_DIR/config"
 # (set in config), and are DISTINCT from RESTIC_PASSWORD_FILE (the encryption password).
 
 # ---- Defaults + required-value guards ----
-declare -p BACKUP_PATHS &>/dev/null || { echo "FATAL: BACKUP_PATHS not set in config" >&2; exit 1; }
-(( ${#BACKUP_PATHS[@]} )) || { echo "FATAL: BACKUP_PATHS is empty" >&2; exit 1; }
+declare -p BACKUP_PATHS &>/dev/null || preflight_fail "BACKUP_PATHS is not set in $CONFIG_DIR/config"
+(( ${#BACKUP_PATHS[@]} )) || preflight_fail "BACKUP_PATHS is empty in $CONFIG_DIR/config"
 declare -p EXTRA_BACKUP_ARGS &>/dev/null || EXTRA_BACKUP_ARGS=()  # e.g. (--one-file-system)
 EXCLUDE_FILE="${EXCLUDE_FILE:-$CONFIG_DIR/excludes}"
 DUMP_DIR="${DUMP_DIR:-$CONFIG_DIR/db-dumps}"
@@ -249,33 +372,11 @@ if (( MAX_AGE_SEC > 0 && FORCE_AFTER_SEC > 0 && MAX_AGE_SEC <= FORCE_AFTER_SEC )
   log "WARN: expect alerts for backups that are not yet due. Raise MAX_BACKUP_AGE_HOURS."
 fi
 
-# State. Cheap, local, and the only thing that survives a reboot: .last-success
-# is what every scheduling and staleness decision is measured against.
-LAST_SUCCESS_FILE="$CONFIG_DIR/.last-success"
-FIRST_SEEN_FILE="$CONFIG_DIR/.first-seen"
-NOTIFY_STATE_FILE="$CONFIG_DIR/.notify-state"
-VERSION_STATE_FILE="$CONFIG_DIR/.version-state"
-LOCK_FILE="$CONFIG_DIR/.lock"
-WG_BOUNCE_FILE="$CONFIG_DIR/.wg-bounce"
-ALERT_AGE_SEC=-1                       # set for real below; safe default for the ERR trap
-
-# ntfy (failure-only; success is intentionally silent)
-NTFY_URL="${NTFY_URL:-}"
+# The config is authoritative from here on: it has just overwritten whatever the
+# pre-parse above guessed. Only the two derived names need re-deriving.
+PING_URL="${RESTIC_PING_URL:-$PING_URL}"
 NTFY_TOPIC_HIGH="${NTFY_TOPIC_HIGH:-backups-high}"
 NTFY_TOPIC_LOW="${NTFY_TOPIC_LOW:-}"                 # "" = drift is log-only
-NTFY_TOKEN="${NTFY_TOKEN:-}"
-PING_URL="${RESTIC_PING_URL:-}"
-
-# ---- Helpers ----
-ping_dms() { [[ -n "$PING_URL" ]] || return 0; curl -fsS -m 10 --retry 3 "$1" >/dev/null 2>&1 || true; }
-
-ntfy() {
-  local topic="$1" priority="$2" tags="$3" title="$4" body="$5"
-  local args=(-H "Title: $title" -H "Priority: $priority" -H "Tags: $tags")
-  [[ -n "$NTFY_TOKEN" ]] && args+=(-H "Authorization: Bearer $NTFY_TOKEN")
-  curl -fsS -m 15 --retry 3 "${args[@]}" --data-binary "$body" \
-    "$NTFY_URL/$topic" >/dev/null 2>&1 || log "WARN: ntfy send failed"
-}
 
 # ---- Version drift -------------------------------------------------------
 # Compares THIS FILE against the published one and says so. It does not fetch
@@ -356,39 +457,6 @@ version_status() {
   else
     printf 'DIFFERS from published -- local %s, remote %s' "${local_sha:0:12}" "${remote:0:12}"
   fi
-}
-
-# Hourly invocation means a stuck host would push 24 urgent notifications a day.
-# Policy, keyed off $NOTIFY_STATE_FILE ("<first> <last> <hard>", removed on every
-# success):
-#   - first failure after a success  -> always push (breakage is actionable NOW)
-#   - later failures, still under MAX_BACKUP_AGE -> log + DMS only
-#   - crossing MAX_BACKUP_AGE        -> push once more (escalation)
-#   - beyond that                    -> push at most every NOTIFY_REPEAT_HOURS,
-#                                       or never again if that is 0
-# Returns 0 if this event should be pushed. Always records the attempt.
-notify_should_push() {
-  local hard="$1" now first last hardflag
-  now=$(date +%s)
-  if [[ ! -s "$NOTIFY_STATE_FILE" ]]; then
-    write_state "$NOTIFY_STATE_FILE" "$now" "$now" "$hard"
-    return 0
-  fi
-  first=0; last=0; hardflag=0
-  read -r first last hardflag < "$NOTIFY_STATE_FILE" || true
-  [[ "$first"    =~ ^[0-9]+$ ]] || first="$now"
-  [[ "$last"     =~ ^[0-9]+$ ]] || last=0
-  [[ "$hardflag" =~ ^[01]$   ]] || hardflag=0
-  # NOTIFY_REPEAT_SEC == 0 must mean "escalate once, then stay quiet". Without
-  # the guard the comparison is trivially true and 0 would do the exact
-  # opposite of every other 0 in this config: re-page on all 24 invocations.
-  if (( hard == 1 )) && { (( hardflag == 0 )) \
-       || (( NOTIFY_REPEAT_SEC > 0 && now - last >= NOTIFY_REPEAT_SEC )); }; then
-    write_state "$NOTIFY_STATE_FILE" "$first" "$now" 1
-    return 0
-  fi
-  write_state "$NOTIFY_STATE_FILE" "$first" "$last" "$hardflag"
-  return 1
 }
 
 notify_failure() {
