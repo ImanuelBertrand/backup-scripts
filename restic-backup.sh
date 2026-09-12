@@ -177,6 +177,7 @@ LAST_SUCCESS_FILE="$CONFIG_DIR/.last-success"
 FIRST_SEEN_FILE="$CONFIG_DIR/.first-seen"
 NOTIFY_STATE_FILE="$CONFIG_DIR/.notify-state"
 VERSION_STATE_FILE="$CONFIG_DIR/.version-state"
+LOCK_FILE="$CONFIG_DIR/.lock"
 ALERT_AGE_SEC=-1                       # set for real below; safe default for the ERR trap
 
 # ntfy (failure-only; success is intentionally silent)
@@ -571,12 +572,36 @@ if (( CHECK_UPDATE_ONLY )); then
 fi
 
 # ---- Single-instance lock ----
-# A backup that runs longer than an hour meets the next invocation head-on. The
-# newcomer exits quietly -- but still through stale_exit, so a run wedged for
-# days is not mistaken for a healthy host.
+# A backup that runs longer than an hour meets the next invocation head-on.
+# The newcomer must NOT judge the holder by .last-success: the holder has not
+# written it yet, so after a week offline that file is a week old and
+# stale_exit() would page "Backup FAILED" about the catch-up run that is at
+# that moment working perfectly -- and long catch-up runs are exactly what
+# FORCE_AFTER_HOURS produces. Judge the HOLDER instead, by how long it has
+# held the lock: that is the only number here that says anything about its
+# health. Still running past MAX_BACKUP_AGE_HOURS is not a slow backup, it is
+# a wedged one, and that does deserve a page.
+lock_held_secs() {                     # seconds since the holder took the lock
+  local mt d
+  mt=$(stat -c %Y "$LOCK_FILE" 2>/dev/null || true)
+  [[ "$mt" =~ ^[0-9]+$ ]] || mt=$NOW   # unknown -> treat as "just started", stay quiet
+  d=$(( NOW - mt ))
+  (( d > 0 )) || d=0                   # clock skew
+  printf '%s' "$d"
+}
 if command -v flock >/dev/null 2>&1; then
-  exec 9>"$CONFIG_DIR/.lock"
-  flock -n 9 || { log "Another run holds the lock; exiting."; stale_exit "another run holds the lock"; }
+  exec 9>>"$LOCK_FILE"                 # append, NOT truncate: opening it must not
+                                       # reset the mtime we are about to read
+  if flock -n 9; then
+    touch "$LOCK_FILE" 2>/dev/null || true    # mtime = when THIS run took the lock
+  else
+    held="$(lock_held_secs)"
+    log "Another run has held the lock for $(fmt_age "$held"); exiting."
+    if (( MAX_AGE_SEC > 0 && held >= MAX_AGE_SEC )); then
+      stale_exit "another run has been stuck for $(fmt_age "$held")"
+    fi
+    exit 0
+  fi
 fi
 
 if [[ ! -s "$FIRST_SEEN_FILE" ]]; then printf '%s\n' "$FIRST_SEEN" > "$FIRST_SEEN_FILE"; fi

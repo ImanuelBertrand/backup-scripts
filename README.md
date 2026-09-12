@@ -324,10 +324,17 @@ later every day until it falls out of the window entirely.
 
 ### 4.3 A skip can no longer hide
 
-Every path that declines to back up — not due, metered link, tunnel down, lock
-held by a still-running backup — exits through the same staleness check. If the
-last success is older than `MAX_BACKUP_AGE_HOURS` the script pages you and exits
-`1`, whatever the reason for the skip.
+Every path that declines to back up — not due, metered link, tunnel down —
+exits through the same staleness check. If the last success is older than
+`MAX_BACKUP_AGE_HOURS` the script pages you and exits `1`, whatever the reason
+for the skip.
+
+The one exception is losing the `flock` to a still-running backup, because
+there the age of the last success describes the *holder*, which has not
+finished yet — on a laptop catching up after a week offline it is a week old
+while the run in progress is perfectly healthy. That skip is judged by how
+long the lock has been held instead: quiet below `MAX_BACKUP_AGE_HOURS`, and
+a page above it, where the holder is not slow but wedged.
 
 This is what makes silent skipping safe, and it closes the hole the old
 `SKIP_IF_UNREACHABLE="true"` left open: a host that quietly stops backing up now
@@ -567,7 +574,7 @@ Then let a real run repair it, or delete `.last-success` to reset.
 | `401 Unauthorized` | `RESTIC_REST_USERNAME` ≠ first path segment of the repo URL (`--private-repos`), or wrong htpasswd password. |
 | Timeout / `unreachable` | WireGuard down. `wg show`, then `curl -i http://10.0.0.2:8000/`. |
 | `repository is already locked` | Concurrent maintenance prune. Clients retry for `LOCK_WAIT`; raise it or move the maintenance window. |
-| `Another run holds the lock; exiting.` | A previous run is still going (`flock`). Not an error — but it still checks staleness, so a run wedged for days does alert. |
+| `Another run has held the lock for …; exiting.` | A previous run is still going (`flock`). Not an error while that time is under `MAX_BACKUP_AGE_HOURS`; past it the holder is treated as wedged and alerts. |
 | `Not due …; exiting.` | Normal, 23 times a day. `--status` shows why. |
 | Backup skipped, no alert | Metered link, tunnel down, or not due — and the last success is still within `MAX_BACKUP_AGE_HOURS`. By design; no ping is sent. |
 | `STALE: no successful backup for …` | The hard fail. The host is alive but hasn't backed up in `MAX_BACKUP_AGE_HOURS`; the log line above it says which skip path it took. |
