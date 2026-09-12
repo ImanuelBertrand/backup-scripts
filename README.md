@@ -801,6 +801,44 @@ Run `deploy.sh` as yourself. It needs no local root — the elevation it needs i
 on the target, through `SUDO` — and under `sudo` `$HOME` is root's, so the host
 list is looked for in `/root/.config/restic`.
 
+#### Deploying to the machine you run it from
+
+An admin box is usually a client too. Name it in `LOCAL_HOST` and its steps run
+in a local shell instead of over ssh — same commands, same plan, same diff, same
+prompt — so it needs no sshd and no key just to deploy to itself:
+
+```bash
+HOSTS=( srv01 srv02 laptop.lan )
+LOCAL_HOST="laptop.lan"             # must be one of HOSTS
+declare -A CRON_MINUTE=( [srv01]=07 [srv02]=23 [laptop.lan]=53 )
+```
+
+**One host, so it is a scalar.** `SBIN_PATH`, `CONFIG_DIR` and `CRON_PATH` are
+one value each, and a second local host would write those same three files over
+the first — cron minute included — on the same machine, reporting success both
+times. Rather than a list plus a check that the list holds one thing, the name
+is one that cannot hold two. Every other host setting here *is* a list, so
+`LOCAL_HOST=( laptop.lan )` is an easy reflex and bash accepts it silently,
+keeping only the first element; that spelling is refused with a message.
+
+It is opt-in by name, not worked out from the hostname. Nothing distinguishes
+*this* machine from a same-named one, and a guess that goes the wrong way skips
+the network for a host you meant to reach across it — then reports a clean
+deploy, having written the files on the admin box instead. A `LOCAL_HOST` that
+is in neither list is refused rather than ignored.
+
+Elevation is still `sudo`, but through `LOCAL_SUDO` (default `sudo`) rather than
+`SUDO`. The `-n` in `SUDO` is there because `BatchMode` ssh has no terminal to
+answer a password prompt on; a local run has yours, so deploying to the machine
+you are sitting at needs no `NOPASSWD` rule. Where `deploy.sh` has no terminal
+either — cron, CI, the runs `--yes` exists for — it puts the `-n` back on its
+own, so a prompt fails fast instead of hanging a deploy nobody is watching.
+
+Nothing else changes. `config`, `encryption-pw` and `pre-backup` are left alone
+here exactly as they are on a remote host, and `restic-backup.sh` is still
+written by rename rather than copied over — the run it must not disturb is the
+hourly root cron job, which is on this machine too.
+
 ### 10.2 Noticing drift
 
 Set `VERSION_CHECK_URL` in each client's config and the script compares itself

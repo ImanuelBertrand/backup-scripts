@@ -29,6 +29,17 @@ set -euo pipefail
 #                    password prompt. Where root logs in directly, set
 #                    SSH_USER="root" and the sudo prefix drops out on its own.
 #
+#                    The host named in LOCAL_HOST is THIS machine, and every step
+#                    for it runs in a local shell instead -- same command text,
+#                    same root-through-sudo rule, no ssh and no sshd. It is
+#                    opt-in per host because nothing here can tell "this
+#                    machine" from a same-named one: matching on the hostname
+#                    would silently skip the network for a host the operator
+#                    meant to reach across it. Local elevation uses $LOCAL_SUDO
+#                    ("sudo"), not $SUDO -- the -n in $SUDO is there because
+#                    BatchMode ssh has no terminal to answer a prompt on, and a
+#                    local run has the operator's own.
+#
 # Where its config is:
 #                    ~/.config/restic/deploy.conf -- the host list, the target
 #                    paths, and the per-host cron minute. That is a description
@@ -133,8 +144,21 @@ if [[ ! -f "$CONF" ]]; then
   exit 1
 fi
 declare -A CRON_MINUTE=()
+# Scalar, because exactly one machine can be the one this is running on.
+# SBIN_PATH, CONFIG_DIR and CRON_PATH are one value each, so a second local host
+# would write those same three files over the first -- cron minute included --
+# on the same machine, and every pass would report success. A name that cannot
+# hold two is the check.
+LOCAL_HOST=""
 SSH_USER="root"
 SUDO="sudo -n"
+# Elevation for LOCAL_HOST. $SUDO carries -n because BatchMode ssh has
+# no terminal to answer a password prompt on; a local run has the operator's, so
+# demanding a NOPASSWD rule to deploy to the machine they are sitting at would
+# buy nothing. Where there is no terminal either -- cron, CI, the runs --yes
+# exists for -- take the -n back, so a prompt fails fast instead of hanging a
+# deploy nobody is watching.
+if [[ -t 0 ]]; then LOCAL_SUDO="sudo"; else LOCAL_SUDO="sudo -n"; fi
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 SBIN_PATH="/usr/local/sbin/restic-backup.sh"
 CONFIG_DIR="/root/.config/restic"
@@ -143,6 +167,36 @@ CRON_PATH="/etc/cron.d/restic-backup"
 source "$CONF"
 declare -p HOSTS &>/dev/null || { echo "FATAL: HOSTS not set in $CONF" >&2; exit 1; }
 (( ${#HOSTS[@]} )) || { echo "FATAL: HOSTS is empty in $CONF" >&2; exit 1; }
+
+# Every other host setting here is a list, so parentheses are the habit this
+# file builds -- and bash takes them on a scalar without complaint, leaving
+# "$LOCAL_HOST" as the FIRST element alone. The rest would be dropped in
+# silence: those hosts go over ssh, which from the machine they name may well
+# connect and succeed, so the run reports a clean deploy.
+if [[ "$(declare -p LOCAL_HOST 2>/dev/null)" == declare\ -[aA]* ]]; then
+  echo "FATAL: LOCAL_HOST in $CONF is set as an array." >&2
+  echo "  Only one host can be the machine this is running on -- SBIN_PATH," >&2
+  echo "  CONFIG_DIR and CRON_PATH are one value each, so a second would write" >&2
+  echo "  the same three files over the first. Name one, without parentheses:" >&2
+  echo >&2
+  echo "      LOCAL_HOST=\"${HOSTS[0]}\"" >&2
+  exit 1
+fi
+# Checked against the WHOLE list, before --host narrows it -- or deploying one
+# remote host would report the local entry as a typo.
+#
+# A name that is in neither is an edit that does nothing: the host it was meant
+# to mark still goes over ssh, which on the operator's own machine may well
+# connect and succeed, so again the run reports a clean deploy and the mode was
+# never on.
+if [[ -n "$LOCAL_HOST" ]]; then
+  found=0
+  for h in "${HOSTS[@]}"; do [[ "$h" == "$LOCAL_HOST" ]] && found=1; done
+  (( found )) || {
+    echo "FATAL: LOCAL_HOST '$LOCAL_HOST' in $CONF is not in HOSTS." >&2
+    echo "  Nothing is marked local, and the host it named keeps going over ssh." >&2
+    exit 1; }
+fi
 
 if (( ${#ONLY_HOSTS[@]} )); then
   declare -a sel=()
@@ -211,15 +265,50 @@ fi
 addr_of() { [[ "$1" == *@* ]] && printf '%s' "$1" || printf '%s@%s' "$SSH_USER" "$1"; }
 sha_of()  { sha256sum "$1" | awk '{print $1}'; }
 
-# The prefix for every remote command, with its trailing space: $SUDO unless the
-# login is already root. EVERY path this tool touches is root-only -- it writes
-# /usr/local/sbin and /etc/cron.d, and it reads, hashes and diffs $CONFIG_DIR
-# under /root -- so this is not confined to the pushes. Left off the reads, the
-# hashes come back empty, every file looks changed, and the run re-pushes the
-# whole fleet on every invocation before failing on the first write.
-sudo_for() {                           # sudo_for <user@host>
-  [[ "${1%%@*}" == root ]] && return 0
+is_local() {                           # is_local <host>
+  [[ -n "$LOCAL_HOST" && "$1" == "$LOCAL_HOST" ]]
+}
+
+# The prefix for every command that needs root, with its trailing space, unless
+# it already runs as root: $SUDO on a remote host, $LOCAL_SUDO on a local one.
+# EVERY path this tool touches is root-only -- it writes /usr/local/sbin and
+# /etc/cron.d, and it reads, hashes and diffs $CONFIG_DIR under /root -- so this
+# is not confined to the pushes. Left off the reads, the hashes come back empty,
+# every file looks changed, and the run re-pushes the whole fleet on every
+# invocation before failing on the first write.
+#
+# Locally the question is who THIS process is, not who a login would be. Running
+# as the operator is the supported way (under sudo, $HOME is root's and the host
+# list is reported missing), so a local prefix is the normal case and $EUID is
+# what says whether it is still needed.
+sudo_for() {                           # sudo_for <host>
+  if is_local "$1"; then
+    (( EUID == 0 )) || printf '%s ' "$LOCAL_SUDO"
+    return 0
+  fi
+  [[ "$(addr_of "$1")" == root@* ]] && return 0
   printf '%s ' "$SUDO"
+}
+
+# Every step this tool takes on a host goes through here, so a local host runs
+# the SAME command text a remote one does: one description of the work, and no
+# second implementation to drift out of step with the prerequisite probe, the
+# checksum round trip or the staged-rename push.
+#
+# That text is safe to reuse verbatim because it is built to survive being
+# expanded twice (see rq): ssh expands it once when this shell builds the
+# command line and once in the remote shell, and `bash -c` is that second
+# expansion with the first already done here.
+#
+# Callers redirect stdin themselves -- </dev/null where ssh took -n, and the
+# file itself in push(). Neither branch may be left reading this script's stdin:
+# that is the terminal the confirmation prompt is answered on.
+on_host() {                            # on_host <host> <script>
+  if is_local "$1"; then
+    bash -c "$2"
+  else
+    ssh "${SSH_OPTS[@]}" "$(addr_of "$1")" "$2"
+  fi
 }
 
 # Single-quote a value for the remote shell. Everything here crosses an ssh
@@ -306,9 +395,9 @@ if (( CHECK_ONLY )); then
     # check_restic_present either) until MAX_BACKUP_AGE_HOURS elapses.
     #
     # Same round trip, and --status runs LAST so $? is still its own exit code.
-    S="$(sudo_for "$(addr_of "$h")")"
-    out=$(ssh -n "${SSH_OPTS[@]}" "$(addr_of "$h")" "$(prereq_probe "$S")
-         ${S}env RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" 2>&1) && s=0 || s=$?
+    S="$(sudo_for "$h")"
+    out=$(on_host "$h" "$(prereq_probe "$S")
+         ${S}env RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" </dev/null 2>&1) && s=0 || s=$?
     prereq="$(prereq_list "$out")"
     [[ -n "$prereq" ]] && PREREQ[$h]="$prereq"
     sed '/^#PRE /d' <<<"$out"
@@ -413,7 +502,6 @@ trap 'if [[ -n "$CURRENT_HOST" ]]; then
       exit 130' INT TERM
 
 for h in "${HOSTS[@]}"; do
-  addr="$(addr_of "$h")"
   # One round trip does the checksums AND the prerequisites. None of these block
   # a push -- a first deploy legitimately precedes the hand-managed config -- but
   # every one of them is a host that installs cleanly and then never backs up,
@@ -423,19 +511,24 @@ for h in "${HOSTS[@]}"; do
   # "unreachable", which sends you off testing `ssh <host>` by hand as yourself
   # and finding it works: deploy connects as $SSH_USER, not as you.
   : > "$ERRTMP"
-  S="$(sudo_for "$addr")"
+  S="$(sudo_for "$h")"
   # The sudo check is its own statement, before anything whose stderr is
   # discarded. A failing `sudo -n` inside the sha256sum line would be swallowed
   # by that 2>/dev/null and read as "all three files are missing", which is
   # indistinguishable from a fresh host -- so the run would cheerfully plan a
   # full push and only discover the truth while writing.
-  remote="$(ssh -n "${SSH_OPTS[@]}" "$addr" "
+  remote="$(on_host "$h" "
       ${S}true || exit 111
       ${S}sha256sum $(rq "$SBIN_PATH") $(rq "$CONFIG_DIR/excludes") $(rq "$CRON_PATH") 2>/dev/null
 $(prereq_probe "$S")
-      true" 2>"$ERRTMP")" || {
+      true" </dev/null 2>"$ERRTMP")" || {
     unreachable+=("$h"); PLAN[$h]="unreachable"
     WHY[$h]="$(grep -v '^$' "$ERRTMP" | tail -n1)"
+    # "unreachable" is the wrong word for the machine this is running on, and
+    # the table is what a run gets read for. The sentinel below stays, since the
+    # passes after this one test it to mean "planned nothing"; only what a human
+    # reads changes.
+    if is_local "$h"; then SHORT[$h]="local step failed"; fi
     [[ "${WHY[$h]}" == sudo:* ]] && SHORT[$h]="sudo failed"
     continue; }
   prereq="$(prereq_list "$remote")"
@@ -461,17 +554,34 @@ printf '\n%-22s %s\n' "HOST" "TO UPDATE"
 for h in "${HOSTS[@]}"; do
   note=""
   [[ "${PLAN[$h]}" == unreachable || -n "${CRON_MINUTE[$h]:-}" ]] || note="   << no CRON_MINUTE"
-  printf '%-22s %s%s\n' "$h" "${SHORT[$h]:-${PLAN[$h]:-up to date}}" "$note"
+  # Marked in the table because it is the row whose push does not cross the
+  # network, and one confirmation below covers every row at once.
+  tag=""; if is_local "$h"; then tag=" (local)"; fi
+  printf '%-22s %s%s\n' "$h$tag" "${SHORT[$h]:-${PLAN[$h]:-up to date}}" "$note"
 done
 if (( ${#unreachable[@]} )); then
   printf '\n%d host(s) could not be planned: %s\n' "${#unreachable[@]}" "${unreachable[*]}"
   for h in "${unreachable[@]}"; do
-    printf '  %-20s %s\n' "$h" "${WHY[$h]:-ssh failed without a message}"
+    printf '  %-20s %s\n' "$h" "${WHY[$h]:-failed without a message}"
   done
-  printf '  Deploy connects as %s@ and runs as root through "%s" -- test both:\n' \
-    "$SSH_USER" "$SUDO"
-  printf '    ssh %s %s %s true\n' \
-    "${SSH_OPTS[*]}" "$(addr_of "${unreachable[0]}")" "$SUDO"
+  # Name the command that actually ran. The ssh hint is printed for the first
+  # host that could not be planned, and a local one reaches no ssh at all -- it
+  # would send someone off testing a connection this never makes.
+  for h in "${unreachable[@]}"; do
+    if is_local "$h"; then
+      printf '  %s deploys locally -- no ssh. Test the elevation it does use:\n' "$h"
+      printf '    %s true\n' "$LOCAL_SUDO"
+      break
+    fi
+  done
+  for h in "${unreachable[@]}"; do
+    if ! is_local "$h"; then
+      printf '  Deploy connects as %s@ and runs as root through "%s" -- test both:\n' \
+        "$SSH_USER" "$SUDO"
+      printf '    ssh %s %s %s true\n' "${SSH_OPTS[*]}" "$(addr_of "$h")" "$SUDO"
+      break
+    fi
+  done
   if grep -qi '^sudo:' <<<"${WHY[*]}"; then
     printf '  That is a sudo failure, not a connection failure. Passwordless sudo is\n'
     printf '  required: BatchMode ssh has no terminal to answer a password prompt on.\n'
@@ -530,9 +640,12 @@ colorize_diff() {
   '
 }
 
-diff_one() {                           # diff_one <addr> <host> <remote-path> <local-file> [label]
-  local addr="$1" host="$2" remote="$3" src="$4" label="${5:-local:$(basename "$4")}" out n
-  out="$(ssh -n "${SSH_OPTS[@]}" "$addr" "$(sudo_for "$addr")cat $(rq "$remote") 2>/dev/null" \
+diff_one() {                           # diff_one <host> <remote-path> <local-file> [label]
+  # "checkout:", not "local:": a LOCAL_HOST row already prints the word local
+  # for something else, while the two sides of this diff are the host and the
+  # working tree -- which is the distinction these labels exist to draw.
+  local host="$1" remote="$2" src="$3" label="${4:-checkout:$(basename "$3")}" out n
+  out="$(on_host "$host" "$(sudo_for "$host")cat $(rq "$remote") 2>/dev/null" </dev/null \
          | diff -u --label "$host:$remote" --label "$label" - "$src" | colorize_diff || true)"
   printf '\n%s--- %s: %s ---%s\n' "$C_BLD" "$host" "$remote" "$C_OFF"
   if [[ -z "$out" ]]; then
@@ -553,14 +666,13 @@ diff_one() {                           # diff_one <addr> <host> <remote-path> <l
 }
 
 show_diffs() {
-  local h a
+  local h
   for h in "${HOSTS[@]}"; do
     [[ -n "${PLAN[$h]}" && "${PLAN[$h]}" != unreachable ]] || continue
-    a="$(addr_of "$h")"
-    [[ "${PLAN[$h]}" == *script*   ]] && diff_one "$a" "$h" "$SBIN_PATH" "$SRC_DIR/restic-backup.sh"
-    [[ "${PLAN[$h]}" == *excludes* ]] && diff_one "$a" "$h" "$CONFIG_DIR/excludes" "$SRC_DIR/excludes"
-    [[ "${PLAN[$h]}" == *cron*     ]] && diff_one "$a" "$h" "$CRON_PATH" "${CRONTMP[$h]}" \
-                                                  "local:restic-backup.cron (minute ${CRON_MINUTE[$h]:-?})"
+    [[ "${PLAN[$h]}" == *script*   ]] && diff_one "$h" "$SBIN_PATH" "$SRC_DIR/restic-backup.sh"
+    [[ "${PLAN[$h]}" == *excludes* ]] && diff_one "$h" "$CONFIG_DIR/excludes" "$SRC_DIR/excludes"
+    [[ "${PLAN[$h]}" == *cron*     ]] && diff_one "$h" "$CRON_PATH" "${CRONTMP[$h]}" \
+                                                  "checkout:restic-backup.cron (minute ${CRON_MINUTE[$h]:-?})"
   done
   return 0
 }
@@ -599,17 +711,21 @@ fi
 # `install` copy back through it into /usr/local/sbin/restic-backup.sh -- which
 # is to say, choose the contents of an hourly root cron job. /tmp being sticky
 # does not help when the name does not exist yet.
+# None of this is about the network, so a local host gets it unchanged: the
+# staging file still lands in the destination directory and is still renamed
+# into place, because the run it must not disturb is the hourly root cron job,
+# which is on the target either way.
 # `tee`, not `cat >`: with an unprivileged login the redirection is performed by
-# the login shell, so `sudo cat > "$dest.new"` opens the staging file as the
-# LOGIN user in a root-owned directory -- permission denied, and where the
+# the calling shell, so `sudo cat > "$dest.new"` opens the staging file as the
+# UNPRIVILEGED user in a root-owned directory -- permission denied, and where the
 # directory happens to be writable, a file root then renames into place that the
 # login user owned for the length of the push. Only the writing process may be
 # the privileged one. The umask above still applies: sudo takes the union of the
 # caller's umask and its own, so the staged file is created 600 either way.
 push() {                               # push <local> <remote-dest> <mode> [dir-mode]
   local src="$1" dest="$2" mode="$3" dirmode="${4:-755}" S
-  S="$(sudo_for "$addr")"
-  ssh "${SSH_OPTS[@]}" "$addr" "
+  S="$(sudo_for "$CURRENT_HOST")"
+  on_host "$CURRENT_HOST" "
     set -eu
     dest=$(rq "$dest"); dir=\$(dirname \"\$dest\")
     [ -d \"\$dir\" ] || ${S}install -d -m $(rq "$dirmode") \"\$dir\"
@@ -623,7 +739,7 @@ push() {                               # push <local> <remote-dest> <mode> [dir-
 rc=0
 for h in "${HOSTS[@]}"; do
   [[ -n "${PLAN[$h]}" && "${PLAN[$h]}" != unreachable ]] || continue
-  addr="$(addr_of "$h")"; CURRENT_HOST="$h"
+  CURRENT_HOST="$h"
   printf '\n=== %s ===\n' "$h"
   ok=1
   # Ordered, and each step gated on the one before it. Running the three pushes
@@ -649,8 +765,8 @@ for h in "${HOSTS[@]}"; do
       || { ok=0; echo "  FAILED to push $CRON_PATH -- this host has no schedule"; }
   fi
   if (( ok )); then
-    ssh -n "${SSH_OPTS[@]}" "$addr" \
-        "$(sudo_for "$addr")env RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" \
+    on_host "$h" \
+        "$(sudo_for "$h")env RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" </dev/null \
       || { echo "  (--status failed)"; rc=1; }
   else
     rc=1

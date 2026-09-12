@@ -24,6 +24,22 @@ HOSTS=(
   laptop.lan
 )
 
+# The one entry above that is THIS machine, if any. Its steps run in a local
+# shell instead of over ssh -- same commands, same root-through-sudo rule, no
+# sshd and no key needed on the admin box just to deploy to itself. Leave it
+# empty on a pure admin box, and give it ONE name, not a list: the paths below
+# are one value each, so a second local host would write those same three files
+# over the first, cron minute included, on this one machine.
+#
+# Opt in by name rather than letting deploy.sh work it out: no test tells "this
+# machine" from a same-named one, and a hostname match that guesses wrong skips
+# the network for a host you meant to reach across it -- then reports a clean
+# deploy, having written the files here.
+#
+# It must be one of HOSTS above. A name that is in neither is refused, not
+# ignored: it marks nothing, and the host it meant keeps going over ssh.
+LOCAL_HOST=""
+
 # Prepended when a HOSTS entry has no "user@".
 SSH_USER="root"
 
@@ -39,6 +55,14 @@ SSH_USER="root"
 #     chmod 440 /etc/sudoers.d/deploy-restic
 # Where root logs in over ssh directly, this is ignored (nothing to elevate).
 SUDO="sudo -n"
+
+# The same, for LOCAL_HOST. It is plain "sudo" because the -n above is
+# there for BatchMode ssh, which has no terminal to answer a prompt on -- a
+# local run has yours, so a NOPASSWD rule to deploy to the machine you are
+# sitting at buys nothing. Where deploy.sh has no terminal either (cron, CI, the
+# runs --yes exists for) it takes the -n back on its own, so a prompt fails fast
+# instead of hanging a deploy nobody is watching. Ignored when already root.
+# LOCAL_SUDO="sudo"
 
 # BatchMode makes an unreachable or passphrase-prompting host fail fast instead
 # of hanging the whole run.
@@ -67,4 +91,8 @@ declare -A CRON_MINUTE=(
 # NEVER deployed, by design:
 #   config, encryption-pw  -- secrets, different on every host, hand-managed
 #   pre-backup             -- per-host hook, hand-managed
+#
+# This holds for LOCAL_HOST too. Deploying to this machine still leaves
+# its config, its password and its hook alone -- local mode changes how the
+# steps run, not which files they are allowed to touch.
 # -----------------------------------------------------------------------------
