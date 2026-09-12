@@ -175,6 +175,7 @@ int_cfg VERSION_CHECK_INTERVAL_HOURS 24
 WG_INTERFACE="${WG_INTERFACE:-}"                     # "" = never touch the tunnel
 WG_RESTART_CMD="${WG_RESTART_CMD:-}"                 # overrides the built-in logic
 int_cfg WG_SETTLE_SECS 5                             # seconds, not hours
+int_cfg WG_BOUNCE_INTERVAL_HOURS 6                   # 0 = bounce on every due run
 
 if declare -p SKIP_IF_UNREACHABLE &>/dev/null; then
   log "WARN: SKIP_IF_UNREACHABLE is obsolete and ignored -- an unreachable backend is"
@@ -187,6 +188,7 @@ FORCE_AFTER_SEC=$(( FORCE_AFTER_HOURS * 3600 ))
 MAX_AGE_SEC=$(( MAX_BACKUP_AGE_HOURS * 3600 ))
 NOTIFY_REPEAT_SEC=$(( NOTIFY_REPEAT_HOURS * 3600 ))
 VERSION_CHECK_INTERVAL_SEC=$(( VERSION_CHECK_INTERVAL_HOURS * 3600 ))
+WG_BOUNCE_INTERVAL_SEC=$(( WG_BOUNCE_INTERVAL_HOURS * 3600 ))
 
 # The hard-fail threshold must sit ABOVE the catch-up threshold, or the script
 # pages you about a backup it was never going to attempt yet.
@@ -202,6 +204,7 @@ FIRST_SEEN_FILE="$CONFIG_DIR/.first-seen"
 NOTIFY_STATE_FILE="$CONFIG_DIR/.notify-state"
 VERSION_STATE_FILE="$CONFIG_DIR/.version-state"
 LOCK_FILE="$CONFIG_DIR/.lock"
+WG_BOUNCE_FILE="$CONFIG_DIR/.wg-bounce"
 ALERT_AGE_SEC=-1                       # set for real below; safe default for the ERR trap
 
 # ntfy (failure-only; success is intentionally silent)
@@ -662,18 +665,37 @@ backend_reachable() {
 }
 
 wg_bounce() {
+  [[ -n "$WG_INTERFACE$WG_RESTART_CMD" ]] || return 1
+
+  # ---- Guards that apply to BOTH paths, checked before either one runs ----
+  # No default route means the host is simply offline: `wg-quick up` could not
+  # resolve the endpoint anyway, and a failed up() after a successful down()
+  # leaves the tunnel DOWN -- strictly worse than what we started with. A
+  # custom WG_RESTART_CMD is no better placed to reach a DNS server than the
+  # built-in path is, so it waits for a default route too.
+  if ! ip route show default 2>/dev/null | grep -q .; then
+    log "WG: no default route -- host is offline; leaving the tunnel alone."
+    return 1
+  fi
+  # "Bounce once" has to mean once per OUTAGE, not once per run. Past
+  # FORCE_AFTER_HOURS every hourly invocation is due, so an endpoint that is
+  # genuinely down for two days would otherwise be met with 48 restarts. The
+  # first bounce of an outage is still immediate -- only retries are spaced --
+  # and a successful backup clears the record.
+  local last since
+  last=$(read_epoch "$WG_BOUNCE_FILE")
+  since=$(( NOW - last ))
+  if (( WG_BOUNCE_INTERVAL_SEC > 0 && last > 0 && since >= 0 \
+        && since < WG_BOUNCE_INTERVAL_SEC )); then
+    log "WG: already bounced $(fmt_age "$since") ago; waiting (WG_BOUNCE_INTERVAL_HOURS=$WG_BOUNCE_INTERVAL_HOURS)."
+    return 1
+  fi
+  write_state "$WG_BOUNCE_FILE" "$NOW"
+
   if [[ -n "$WG_RESTART_CMD" ]]; then
     log "WG: running WG_RESTART_CMD"
     if ! bash -c "$WG_RESTART_CMD"; then log "WG: WG_RESTART_CMD failed."; return 1; fi
     sleep "$WG_SETTLE_SECS"; return 0
-  fi
-  [[ -n "$WG_INTERFACE" ]] || return 1
-  # No default route means the host is simply offline: `wg-quick up` could not
-  # resolve the endpoint anyway, and a failed up() after a successful down()
-  # leaves the tunnel DOWN -- strictly worse than what we started with.
-  if ! ip route show default 2>/dev/null | grep -q .; then
-    log "WG: no default route -- host is offline; leaving $WG_INTERFACE alone."
-    return 1
   fi
   # Never run wg-quick behind systemd's back: it would leave the unit thinking
   # the interface is still up.
@@ -754,6 +776,7 @@ run_step "backup" restic backup \
 # never touch it, or a wedged host would look freshly backed up.
 write_state "$LAST_SUCCESS_FILE" "$(date +%s)"
 rm -f "$NOTIFY_STATE_FILE"            # failure streak is over; next failure pages again
+rm -f "$WG_BOUNCE_FILE"               # tunnel is fine; the next outage may bounce at once
 
 log "Backup complete."
 ping_dms "$PING_URL"

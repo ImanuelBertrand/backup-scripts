@@ -124,7 +124,7 @@ SKIP_IF_METERED="true"
 REST_HEALTH_URL="http://10.0.0.2:8000/"
 
 # ---- WireGuard self-heal (optional) -----------------------------------------
-# If the probe above fails, bounce the tunnel once and try again. This targets
+# If the probe above fails, bounce the tunnel and try again. This targets
 # the tunnel that is "up" but dead: the peer's endpoint moved (dynamic DNS, new
 # NAT mapping) and the kernel keeps talking to the old address forever.
 #
@@ -134,7 +134,8 @@ REST_HEALTH_URL="http://10.0.0.2:8000/"
 # back would leave the unit thinking the interface is still up. It also refuses
 # to touch the tunnel when there is no default route: the host is simply offline,
 # `wg-quick up` could not resolve the endpoint, and a failed up() after a
-# successful down() leaves you worse off than before.
+# successful down() leaves you worse off than before. That refusal covers
+# WG_RESTART_CMD too -- a custom restart cannot reach a DNS server either.
 WG_INTERFACE=""                                    # e.g. "wg0"
 
 # Escape hatch for tunnels managed by something else (NetworkManager, a custom
@@ -144,6 +145,14 @@ WG_INTERFACE=""                                    # e.g. "wg0"
 
 # Seconds to wait after a restart before re-probing.
 # WG_SETTLE_SECS="5"
+
+# Don't bounce again within this many hours. Cron calls the script hourly and
+# past FORCE_AFTER_HOURS every one of those runs is due, so without this a
+# backend that is genuinely down for two days would be met with 48 tunnel
+# restarts. The FIRST bounce of an outage is always immediate -- this only
+# spaces the retries -- and a successful backup resets it.
+#   0 = no limit (bounce on every due run, the old behaviour)
+# WG_BOUNCE_INTERVAL_HOURS="6"
 
 # ---- Failure notifications (ntfy) -- failure-only; success is silent --------
 # Your ntfy base URL (self-hosted or https://ntfy.sh). No trailing slash.
