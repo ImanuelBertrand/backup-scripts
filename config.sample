@@ -94,9 +94,11 @@ FORCE_AFTER_HOURS="24"
 # ---- Staleness = the hard fail ----------------------------------------------
 # THIS replaces the old SKIP_IF_UNREACHABLE boolean. Skipping is always silent;
 # what turns silence into an alert is age. Every path that declines to back up
-# (not due, metered, tunnel down, lock held) checks this first, so a host that
-# quietly stops backing up pages you locally instead of waiting on the external
-# dead-man's switch.
+# (not due, metered, tunnel down) checks this first, so a host that quietly
+# stops backing up pages you locally instead of waiting on the external
+# dead-man's switch. Losing the lock to a still-running backup is checked
+# against how long THAT run has been going instead -- the last success says
+# nothing about a run that has not finished -- but against this same limit.
 #
 #   servers          : 36   (one missed night is fine; two is not)
 #   laptop that travels: 168 (a week away from the tunnel is normal)
@@ -139,8 +141,10 @@ REST_HEALTH_URL="http://10.0.0.2:8000/"
 WG_INTERFACE=""                                    # e.g. "wg0"
 
 # Escape hatch for tunnels managed by something else (NetworkManager, a custom
-# unit). If set, this runs INSTEAD of the built-in logic. WG_INTERFACE is then
-# only a label.
+# unit). If set, this replaces the systemctl / wg-quick restart above, and
+# WG_INTERFACE becomes only a label. It does NOT bypass the two guards: the
+# no-default-route refusal and WG_BOUNCE_INTERVAL_HOURS below are both checked
+# before either path runs.
 # WG_RESTART_CMD="nmcli connection up wg0"
 
 # Seconds to wait after a restart before re-probing.

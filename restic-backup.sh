@@ -36,10 +36,13 @@ set -euo pipefail
 # load-bearing -- it is the only record of when a backup last worked.
 #
 # MAX_BACKUP_AGE_HOURS=36 is the hard fail. Every path that declines to back up
-# (not due, metered, tunnel down, lock held) exits through stale_exit(), so a
-# host that quietly stops backing up alerts LOCALLY instead of relying on the
-# external dead-man's switch. This is what makes a skip safe: it can no longer
-# hide. A transient failure inside the window is logged and retried next hour;
+# (not due, metered, tunnel down) exits through stale_exit(), so a host that
+# quietly stops backing up alerts LOCALLY instead of relying on the external
+# dead-man's switch. This is what makes a skip safe: it can no longer hide.
+# Losing the lock is the one skip judged on a different number -- how long the
+# HOLDER has held it, because .last-success describes a run that has already
+# finished, not the one still going (see the lock section). Same threshold.
+# A transient failure inside the window is logged and retried next hour;
 # only the first failure after a success, and the crossing of MAX_BACKUP_AGE,
 # page you (see notify_failure) -- 24 invocations a day must not mean 24 pushes.
 #
@@ -133,8 +136,8 @@ int_cfg() {                            # int_cfg NAME DEFAULT
   declare -n _ref="$_n"
   _raw="${_ref:-$_d}"
   if [[ ! "$_raw" =~ ^[0-9]+$ ]]; then
-    log "WARN: $_n='$_raw' is not a whole number of hours; using the default $_d."
-    log "WARN: Fix $CONFIG_DIR/config -- a typo here must not disable the check."
+    log "WARN: $_n='$_raw' is not a whole number; using the default $_d."
+    log "WARN: Fix $CONFIG_DIR/config -- a typo must not silently change this knob."
     _raw="$_d"
   fi
   _ref="$_raw"
@@ -171,7 +174,8 @@ int_cfg NOTIFY_REPEAT_HOURS  12                      # re-page interval while st
 VERSION_CHECK_URL="${VERSION_CHECK_URL:-}"           # "" = disabled
 int_cfg VERSION_CHECK_INTERVAL_HOURS 24
 
-# WireGuard self-heal: bounce the tunnel once if the backend is unreachable.
+# WireGuard self-heal: bounce the tunnel if the backend is unreachable, at most
+# once per WG_BOUNCE_INTERVAL_HOURS and never without a default route.
 WG_INTERFACE="${WG_INTERFACE:-}"                     # "" = never touch the tunnel
 WG_RESTART_CMD="${WG_RESTART_CMD:-}"                 # overrides the built-in logic
 int_cfg WG_SETTLE_SECS 5                             # seconds, not hours
@@ -549,9 +553,12 @@ in_backup_window() {
   if (( s < e )); then (( h >= s && h < e )); else (( h >= s || h < e )); fi   # wraps midnight
 }
 
-# Every exit path that did NOT back up comes through here, so that a host which
-# quietly stops backing up still alerts -- locally, without waiting on the
-# external dead-man's switch. Exits 1 when stale (a real failure), else 0.
+# Every exit path that did NOT back up comes through here -- except losing the
+# flock, which is measured against the holder's age instead (see the lock
+# section) -- so that a host which quietly stops backing up still alerts,
+# locally, without waiting on the external dead-man's switch. Both paths use
+# MAX_BACKUP_AGE_HOURS; they differ only in which age they compare against.
+# Exits 1 when stale (a real failure), else 0.
 stale_exit() {
   local reason="$1"
   if (( MAX_AGE_SEC > 0 && ALERT_AGE_SEC >= MAX_AGE_SEC )); then

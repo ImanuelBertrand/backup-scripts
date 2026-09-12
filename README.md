@@ -133,13 +133,13 @@ which is exactly when you need them.
 ### 2.1 Self-heal: bouncing a tunnel that is up but dead
 
 If the reachability probe fails and `WG_INTERFACE` is set, the script bounces the
-tunnel once and probes again. This targets the tunnel that is "up" but dead: the
+tunnel and probes again. This targets the tunnel that is "up" but dead: the
 peer's endpoint moved (dynamic DNS, a new NAT mapping) and the kernel goes on
 talking to the old address indefinitely. Split-tunnel `AllowedIPs = 10.0.0.0/24`
 keeps the blast radius at zero — bouncing the interface cannot drop your SSH
 session.
 
-Three guards worth knowing about:
+Four guards worth knowing about:
 
 - It prefers `systemctl restart wg-quick@<if>` whenever that unit is active, and
   only falls back to `wg-quick down/up`. Running `wg-quick` behind systemd's back
@@ -147,8 +147,18 @@ Three guards worth knowing about:
 - With **no default route** it does not touch the tunnel at all. The host is
   simply offline; `wg-quick up` could not resolve the endpoint anyway, and a
   failed `up` after a successful `down` leaves you worse off than before.
+- **At most one bounce per `WG_BOUNCE_INTERVAL_HOURS`** (default `6`, `0` to
+  disable the limit). Cron calls the script hourly and past `FORCE_AFTER_HOURS`
+  every one of those runs is due, so a backend that is genuinely down for two
+  days would otherwise be met with 48 restarts. The *first* bounce of an outage
+  is still immediate — only the retries are spaced — and a successful backup
+  resets the interval.
 - If something else owns the tunnel (NetworkManager, a bespoke unit), set
-  `WG_RESTART_CMD` instead — it replaces the built-in logic entirely.
+  `WG_RESTART_CMD` and it runs in place of the `systemctl` / `wg-quick` logic
+  above. It does **not** opt out of the other two guards: the default-route
+  check and the bounce interval are both evaluated before either path runs.
+  A custom restart command is no better able to resolve an endpoint on a host
+  with no route than the built-in one is.
 
 A host that needs a nightly bounce has a different problem underneath (endpoint
 DNS TTL, or a NAT timeout shorter than `PersistentKeepalive`). Grep the log for
@@ -208,6 +218,7 @@ Then set the per-host behaviour:
 | `MAX_BACKUP_AGE_HOURS` | `"36"` — one missed night is fine, two is not | `"168"` — a week away from the tunnel is normal |
 | `BACKUP_WINDOW` | `"23-06"` | `"23-06"` (rarely satisfied — see note) |
 | `WG_INTERFACE` | `"wg0"` if the tunnel is local to this host | `"wg0"` |
+| `WG_BOUNCE_INTERVAL_HOURS` | `"6"` (default) | `"6"` (default) |
 | `EXTRA_BACKUP_ARGS` | `(--one-file-system)` | `(--one-file-system)` |
 
 > **`SKIP_IF_UNREACHABLE` is gone.** An unreachable backend is now *always* a
@@ -580,7 +591,9 @@ Then let a real run repair it, or delete `.last-success` to reset.
 | `STALE: no successful backup for …` | The hard fail. The host is alive but hasn't backed up in `MAX_BACKUP_AGE_HOURS`; the log line above it says which skip path it took. |
 | `notification suppressed (already alerted…)` | Throttling (§4.3), not a new problem. The original push already went out. |
 | Nothing runs at all after migrating | `/etc/cron.d` entry has a dot in its filename — cronie ignores it silently. Rename, `systemctl reload crond`. |
-| `WG: 'wg-quick up wg0' FAILED — the tunnel is now DOWN` | The bounce brought the tunnel down and could not bring it back (endpoint unresolvable). Fix the tunnel by hand; the script won't retry until the next invocation. |
+| `WG: 'wg-quick up wg0' FAILED — the tunnel is now DOWN` | The bounce brought the tunnel down and could not bring it back (endpoint unresolvable). Fix the tunnel by hand; the script won't try again for `WG_BOUNCE_INTERVAL_HOURS`. |
+| `WG: already bounced … ago; waiting` | The bounce rate limit (§2.1), not a failure. The tunnel was restarted recently and the backend is still unreachable — the underlying problem is not one a bounce fixes. |
+| `WG: no default route — host is offline` | Nothing to self-heal: the host has no route at all, so the tunnel is not the problem. Applies to `WG_RESTART_CMD` too. |
 | Cron mails you 24 times a day | `MAILTO=""` missing from `/etc/cron.d/restic-backup`, or the `logger` redirect dropped. |
 | Dump fails, whole backup aborts | Intended. Fix the dump — don't disable the check. |
 | `no mariadb-dump/pg_dumpall in container` | `DOCKER_AUTO` on a SQLite container. Use `SQLITE_FILES` with the host path, or the hook. |
