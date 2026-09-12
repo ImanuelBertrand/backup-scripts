@@ -48,9 +48,10 @@ BACKUP_PATHS=(/)
 # and cloud-image layout. A snapshot then holds the root filesystem and nothing
 # else, and nothing says so until a restore.
 #
-# So the script refuses to run with this flag while a mounted filesystem inside
-# BACKUP_PATHS would be skipped. It names each one and its answer is one of:
-# add it to BACKUP_PATHS, exclude it, or declare it below.
+# So the script names every mounted filesystem inside BACKUP_PATHS that this
+# flag is skipping, and pages about it -- while still backing up everything it
+# can reach, because a snapshot missing one mount beats no snapshot at all. The
+# answer is one of: add it to BACKUP_PATHS, exclude it, or declare it below.
 EXTRA_BACKUP_ARGS=(--one-file-system)
 
 # Mounts that are deliberately NOT backed up -- scratch space, a media library

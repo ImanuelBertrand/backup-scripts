@@ -244,12 +244,16 @@ UNBACKED_MOUNTS=()                           # mounts you chose not to back up
 > LVM and cloud-image layout. The snapshot then contains the root filesystem and
 > nothing else, exits `0`, and looks like every healthy backup until a restore.
 >
-> The script therefore refuses to run with the flag set while any mounted
-> filesystem inside `BACKUP_PATHS` would be skipped. It names each one, and the
-> fix is to add it to `BACKUP_PATHS`, exclude it, or list it in
-> `UNBACKED_MOUNTS` to say the omission is deliberate. Pseudo-filesystems and
-> bind mounts within the same filesystem are not reported — restic crosses the
-> latter regardless, because `--one-file-system` compares device ids.
+> The script therefore names every mounted filesystem inside `BACKUP_PATHS`
+> that the flag is skipping, and pages about it at urgent priority — once when
+> the set appears, again whenever it changes, then at most every
+> `NOTIFY_REPEAT_HOURS`. The backup still runs: a snapshot missing one mount is
+> worth more than the no-snapshot-at-all that refusing would produce on every
+> hourly run until someone edited the config on that host. The fix is to add it
+> to `BACKUP_PATHS`, exclude it, or list it in `UNBACKED_MOUNTS` to say the
+> omission is deliberate. Pseudo-filesystems and bind mounts within the same
+> filesystem are not reported — restic crosses the latter regardless, because
+> `--one-file-system` compares device ids.
 >
 > A source path that exists but is **empty and not a mountpoint** is refused for
 > the same reason: that is exactly what a filesystem that failed to mount looks

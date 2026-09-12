@@ -251,6 +251,7 @@ NOTIFY_STATE_FILE="$CONFIG_DIR/.notify-state"
 VERSION_STATE_FILE="$CONFIG_DIR/.version-state"
 LOCK_FILE="$CONFIG_DIR/.lock"
 WG_BOUNCE_FILE="$CONFIG_DIR/.wg-bounce"
+MOUNT_GAP_FILE="$CONFIG_DIR/.mount-gap-state"
 ALERT_AGE_SEC=-1                       # set for real below; safe default for the ERR trap
 NOTIFY_REPEAT_SEC=43200                # 12h, the default; recomputed from the config below
 
@@ -853,6 +854,31 @@ from BACKUP_PATHS."
   done
 }
 
+# Throttle for the coverage alert below. It cannot use $NOTIFY_STATE_FILE: that
+# one is removed on every success, and these runs DO succeed -- the gap does not
+# stop the backup -- so it would page on all 24 invocations a day. Keyed on the
+# SET of gaps instead, so a new mount appearing is its own event rather than
+# being swallowed by the repeat interval. State: "<epoch> <key>".
+#
+# Pages when the set first appears, whenever it changes, and then at most every
+# NOTIFY_REPEAT_HOURS (0 = never again), matching notify_should_push's policy.
+mount_gap_should_push() {              # mount_gap_should_push KEY
+  (( REPORT_ONLY )) && return 1
+  local key="$1" last=0 seen=""
+  if [[ -s "$MOUNT_GAP_FILE" ]]; then
+    read -r last seen < "$MOUNT_GAP_FILE" || true
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  fi
+  # A $last in the future (clock skew) suppresses until it passes, which is the
+  # quiet choice -- the same one lock_held_secs makes for an unreadable mtime.
+  if [[ "$seen" == "$key" ]] \
+     && { (( NOTIFY_REPEAT_SEC <= 0 )) || (( NOW - last < NOTIFY_REPEAT_SEC )); }; then
+    return 1
+  fi
+  write_state "$MOUNT_GAP_FILE" "$NOW" "$key"
+  return 0
+}
+
 # Every local mount that --one-file-system will silently decline to cross.
 check_one_file_system_coverage() {
   one_file_system_in_use || return 0
@@ -900,20 +926,56 @@ check_one_file_system_coverage() {
     gap_labels+=("$target  ($fstype)")
   done < /proc/self/mounts
 
-  (( ${#gap_targets[@]} )) || return 0
-  # %q so a path with a space is pasteable as ONE array element.
-  local suggestion; suggestion="$(printf '%q ' "${gap_targets[@]}")"
-  preflight_fail \
-"--one-file-system is in EXTRA_BACKUP_ARGS, and these mounted filesystems are
-inside the backup set but will be silently skipped:
+  if (( ! ${#gap_targets[@]} )); then
+    # Cleared, so that the same set reappearing later pages immediately rather
+    # than waiting out a repeat interval left over from the last occurrence.
+    rm -f "$MOUNT_GAP_FILE" 2>/dev/null || true
+    return 0
+  fi
+
+  # This ALERTS, it no longer aborts. It used to call preflight_fail, which
+  # exits -- so a transient mount inside the backup set that is not under /mnt,
+  # /media or /run (a one-off NFS share at /srv/incoming, a loop-mounted image,
+  # a btrfs subvolume an update created) turned every subsequent hourly run into
+  # no backup AT ALL, with no operator override: --force does not reach past
+  # here either. The state that was being defended against -- a snapshot missing
+  # one mount -- is strictly better than the state that produced: no snapshot,
+  # of anything, until someone hand-edits the config on that host.
+  #
+  # So: back up what we can, and make the gap as loud as the abort was. Urgent
+  # priority, the same throttle policy, and stderr as well as the log, because
+  # the point of the original gate stands -- the flag's omissions are invisible
+  # at restore time, and nothing else on this host will mention them.
+  # %q so a path with a space is pasteable as ONE array element -- and, since %q
+  # leaves no literal spaces behind, the set doubles as a single-line state key.
+  local suggestion key body
+  suggestion="$(printf '%q ' "${gap_targets[@]}")"
+  key="${suggestion% }"
+  body="--one-file-system is in EXTRA_BACKUP_ARGS, and these mounted filesystems are
+inside the backup set and are being SKIPPED:
 
 $(printf '  %s\n' "${gap_labels[@]}")
 
-Each one would be missing from every snapshot, with no error at restore time.
+Each one is missing from every snapshot, with no error at restore time.
 Either add it to BACKUP_PATHS in $CONFIG_DIR/config, exclude it in
 $EXCLUDE_FILE, or -- if it really should not be backed up -- acknowledge it:
 
-  UNBACKED_MOUNTS=(${suggestion% })"
+  UNBACKED_MOUNTS=($key)"
+
+  log "WARN: --one-file-system is skipping ${#gap_targets[@]} mounted filesystem(s): ${gap_labels[*]}"
+  printf 'WARNING: %s\n' "$body" >&2
+  if mount_gap_should_push "$key"; then
+    ntfy "$NTFY_TOPIC_HIGH" urgent file_folder \
+      "Backup INCOMPLETE on $(hostname) (mounts skipped)" \
+"Host: $(hostname)
+The backup is still running -- but it does not contain everything.
+
+$body"
+  elif (( REPORT_ONLY )); then
+    log "NOTICE: diagnostic mode -- no alert sent, no notification state written"
+  else
+    log "NOTICE: notification suppressed (already alerted about this exact set)"
+  fi
 }
 
 # ============================================================================
