@@ -17,7 +17,7 @@ set -euo pipefail
 #                    pre-backup                -- per-host hook, hand-managed
 #
 #   ./deploy.sh                 plan, show diffs, ask, then apply
-#   ./deploy.sh --check         change nothing; report each host's --status
+#   ./deploy.sh --check         report each host's --status; alerts nobody
 #   ./deploy.sh --dry-run       plan and diff only
 #   DIFF_LINES=0 ./deploy.sh    show every diff line (default: first 60 per file)
 #   ./deploy.sh --host srv01    just that host (repeatable)
