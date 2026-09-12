@@ -64,6 +64,21 @@ if (( ${#ONLY_HOSTS[@]} )); then
   HOSTS=("${sel[@]}")
 fi
 
+# A host listed in HOSTS but missing from CRON_MINUTE gets the script and no
+# schedule. It then never backs up -- and the staleness alerting that would
+# normally catch that only ever runs FROM cron, so nothing on that host or
+# here will say a word. Its --status even reads "no successful backup on
+# record", which is exactly what a healthy fresh install prints. Pure config,
+# so it costs no ssh and is checked before anything is pushed.
+declare -a NO_CRON=()
+for h in "${HOSTS[@]}"; do [[ -n "${CRON_MINUTE[$h]:-}" ]] || NO_CRON+=("$h"); done
+warn_no_cron() {
+  (( ${#NO_CRON[@]} )) || return 0
+  printf '\nWARNING: no CRON_MINUTE in %s for: %s\n' "$CONF" "${NO_CRON[*]}" >&2
+  printf '  These hosts get the script but no schedule, so they will never back\n' >&2
+  printf '  up and nothing will alert about it. Add a minute for each in %s.\n' "$CONF" >&2
+}
+
 addr_of() { [[ "$1" == *@* ]] && printf '%s' "$1" || printf '%s@%s' "$SSH_USER" "$1"; }
 sha_of()  { sha256sum "$1" | awk '{print $1}'; }
 
@@ -86,6 +101,7 @@ if (( CHECK_ONLY )); then
       echo "  no status: unreachable, not installed, or no config"; rc=1
     fi
   done
+  warn_no_cron
   exit "$rc"
 fi
 
@@ -123,8 +139,13 @@ for h in "${HOSTS[@]}"; do
 done
 
 printf '\n%-22s %s\n' "HOST" "TO UPDATE"
-for h in "${HOSTS[@]}"; do printf '%-22s %s\n' "$h" "${PLAN[$h]:-up to date}"; done
+for h in "${HOSTS[@]}"; do
+  note=""
+  [[ "${PLAN[$h]}" == unreachable || -n "${CRON_MINUTE[$h]:-}" ]] || note="   << no CRON_MINUTE"
+  printf '%-22s %s%s\n' "$h" "${PLAN[$h]:-up to date}" "$note"
+done
 (( ${#unreachable[@]} )) && printf '\n%d host(s) unreachable: %s\n' "${#unreachable[@]}" "${unreachable[*]}"
+warn_no_cron
 
 if (( pending == 0 )); then
   echo; echo "Nothing to do."
