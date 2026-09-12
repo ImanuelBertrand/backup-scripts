@@ -611,7 +611,12 @@ db_dump_to() {
   local name; name="$(_slug "$1")"; shift
   local out="$DUMP_DIR/$name.sql" tmp="$DUMP_DIR/$name.sql.tmp" err="$DUMP_DIR/$name.sql.err"
   log ">>> dump $name"
-  set +e; "$@" >"$tmp" 2>"$err"; local rc=$?; set -e
+  # 9>&- for the same reason run_step closes it: these are config-supplied
+  # commands (docker exec, sudo -u postgres pg_dump ...), so anything one of
+  # them leaves running in the background would inherit the flock and hold it
+  # for good -- every later run would report "another run has held the lock for
+  # Nh" and never back up again.
+  set +e; "$@" 9>&- >"$tmp" 2>"$err"; local rc=$?; set -e
   if (( rc != 0 )) || [[ ! -s "$tmp" ]]; then
     local why; if (( rc != 0 )); then why="exit $rc"; else why="empty output"; rc=1; fi
     local msg; msg="$(tail -c 800 "$err" 2>/dev/null)"
