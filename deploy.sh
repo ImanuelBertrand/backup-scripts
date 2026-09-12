@@ -149,10 +149,17 @@ if (( CHECK_ONLY )); then
   rc=0
   for h in "${HOSTS[@]}"; do
     printf '\n=== %s ===\n' "$h"
-    if ! ssh -n "${SSH_OPTS[@]}" "$(addr_of "$h")" \
-         "RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" 2>&1; then
-      echo "  no status: unreachable, not installed, or no config"; rc=1
-    fi
+    out=$(ssh -n "${SSH_OPTS[@]}" "$(addr_of "$h")" \
+         "RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" 2>&1) && s=0 || s=$?
+    printf '%s\n' "$out"
+    # 3 is --status's "past MAX_BACKUP_AGE_HOURS". It used to print
+    # "stale : YES -- would alert" and exit 0, so a host that had quietly
+    # stopped backing up sailed through this gate.
+    case "$s" in
+      0) ;;
+      3) echo "  STALE: no successful backup within MAX_BACKUP_AGE_HOURS"; rc=1 ;;
+      *) echo "  no status: unreachable, not installed, or no config"; rc=1 ;;
+    esac
   done
   warn_no_cron
   # A fleet with unscheduled hosts is not healthy, so --check must not exit 0 on

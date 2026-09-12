@@ -430,6 +430,15 @@ stale        : no
 decision     : not due, would skip
 ```
 
+It changes nothing, but it does report through its exit code, so it works as a
+health probe on its own:
+
+| Exit | Meaning |
+|-----:|---------|
+| `0`  | healthy |
+| `3`  | no successful backup within `MAX_BACKUP_AGE_HOURS` (`stale: YES`) |
+| `1`  | cannot tell — missing, untrusted or unparseable config |
+
 ```bash
 journalctl -t restic-backup -n 50        # what cron actually ran
 journalctl -t restic-backup | grep 'WG:' # tunnel restarts (see 2.1)
@@ -623,10 +632,16 @@ monitoring is only as good as the last time you proved the alarm works.
 The staleness path is worth testing too, and it is cheap:
 
 ```bash
-# pretend the last success was 40h ago; expect one urgent ntfy and exit 1
+# pretend the last success was 40h ago
 printf '%s\n' $(( $(date +%s) - 40*3600 )) > /root/.config/restic/.last-success
-restic-backup.sh --status          # 'stale: YES -- would alert'
+
+restic-backup.sh --status   # 'stale: YES -- would alert'; exit 3, sends nothing
+restic-backup.sh            # the real run: one urgent ntfy, one /fail ping
 ```
+
+`--status` is the dry half of that test on purpose: it reports the verdict
+without pinging anything and without touching `.notify-state`, so it cannot
+spend the one alert the next real run was going to send.
 
 Then let a real run repair it, or delete `.last-success` to reset.
 
@@ -675,6 +690,8 @@ $EDITOR deploy.conf
 ./deploy.sh                 # plan → diff → confirm → push → show each --status
 ./deploy.sh --dry-run       # plan and diff only
 ./deploy.sh --check         # change nothing; print every host's --status
+                            # exits non-zero on a stale, unreachable or
+                            # unscheduled host, so it works as a CI gate
 ./deploy.sh --host srv01    # one host (repeatable)
 ```
 

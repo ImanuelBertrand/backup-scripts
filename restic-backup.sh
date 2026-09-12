@@ -84,7 +84,8 @@ Usage: restic-backup.sh [--force] [--status] [--check-update]
 
   --force         back up now, ignoring the window / min-interval / metered
                   gates (reachability still applies -- nowhere to push to)
-  --status        print the scheduling decision and exit; changes nothing
+  --status        print the scheduling decision and exit; changes nothing.
+                  Exit 0 healthy, 3 past MAX_BACKUP_AGE_HOURS, 1 cannot tell
   --check-update  compare this file against the published version and report.
                   NEVER downloads or installs anything -- deploy with deploy.sh
 USAGE
@@ -980,6 +981,12 @@ if (( STATUS_ONLY )); then
     "$( (( MAX_AGE_SEC > 0 && ALERT_AGE_SEC >= MAX_AGE_SEC )) && echo 'YES -- would alert' || echo no )"
   printf 'version      : %s\n' "$(version_status)"
   printf 'decision     : %s\n' "${DUE_REASON:-not due, would skip}"
+  # Exit 3, not 0, when this host is past MAX_BACKUP_AGE_HOURS. --status is the
+  # only way to ask a host "are you healthy?" without touching anything, and
+  # deploy.sh --check runs it fleet-wide from CI; a mode that answered "stale:
+  # YES -- would alert" and exited 0 made that gate pass on exactly the hosts
+  # it exists to catch. Still no side effects -- only the code changes.
+  (( MAX_AGE_SEC > 0 && ALERT_AGE_SEC >= MAX_AGE_SEC )) && exit 3
   exit 0
 fi
 
