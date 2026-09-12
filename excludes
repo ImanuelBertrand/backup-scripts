@@ -31,6 +31,19 @@
 /swapfile
 /swap.img
 
+# ---- This client's own restic secrets ----
+# The encryption password inside the repository it unlocks is worse than
+# useless: it cannot help you (you need it to read the snapshot in the first
+# place), and it means anyone who obtains one snapshot's password also gets the
+# rest-server credentials and the ntfy token from `config` -- and that every
+# retired password stays in plaintext in the history for as long as the snapshot
+# does. Keep both OFF the machine, as README section 3.2 says.
+#
+# Named file by file on purpose: $DUMP_DIR lives in the same directory and MUST
+# stay in the backup. Adjust these two paths if CONFIG_DIR is not the default.
+/root/.config/restic/encryption-pw
+/root/.config/restic/config
+
 # ---- Live MySQL/MariaDB data: captured via consistent dumps instead ----
 /var/lib/mysql
 

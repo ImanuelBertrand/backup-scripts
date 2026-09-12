@@ -202,6 +202,15 @@ chmod 600 /root/.config/restic/encryption-pw
 > permanently unreadable. There is no recovery path. The maintenance host also
 > needs a copy (see §6).
 
+`encryption-pw` and `config` are in the exclude file, so a `(/)` backup does not
+contain them. A password inside the repository it unlocks cannot help you — you
+need it to read the snapshot in the first place — while it does mean that one
+leaked client password yields that host's rest-server credentials and ntfy token
+as well, and that every retired password stays readable for as long as an old
+snapshot survives. `$DUMP_DIR` sits in the same directory and *is* backed up;
+the two files are named individually for that reason. If you move `CONFIG_DIR`,
+move these two lines with it.
+
 ### 3.3 Edit the config
 
 Fill in `/root/.config/restic/config`. The minimum:
