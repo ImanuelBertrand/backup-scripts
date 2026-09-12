@@ -875,17 +875,20 @@ from BACKUP_PATHS."
 # --status must stay cheap and side-effect-free, and the age says how fresh the
 # answer is.
 mount_gap_status() {
-  local last=0 seen="" n
+  local last=0 seen="" n when=""
   one_file_system_in_use || { printf -- '--one-file-system not in use'; return; }
-  [[ -s "$MOUNT_GAP_FILE" ]] || { printf 'all mounts covered'; return; }
+  # No state file at all means no due run has scanned yet -- a fresh deploy,
+  # whose first run FORCE_AFTER_HOURS may put a day out. Distinct from a run
+  # that looked and found nothing, which records an empty set below.
+  [[ -s "$MOUNT_GAP_FILE" ]] || { printf 'not yet checked (no due run since deploy)'; return; }
   read -r last seen < "$MOUNT_GAP_FILE" || true
   [[ "$last" =~ ^[0-9]+$ ]] || last=0
-  n=$(wc -w <<<"$seen")
-  if (( last > 0 )); then
-    printf '%s SKIPPED by --one-file-system as of %s ago: %s' \
-      "$n" "$(fmt_age $(( NOW - last )))" "$seen"
+  if (( last > 0 )); then when=" as of $(fmt_age $(( NOW - last ))) ago"; fi
+  if [[ -z "$seen" ]]; then
+    printf 'all mounts covered%s' "$when"
   else
-    printf '%s SKIPPED by --one-file-system: %s' "$n" "$seen"
+    n=$(wc -w <<<"$seen")
+    printf '%s SKIPPED by --one-file-system%s: %s' "$n" "$when" "$seen"
   fi
 }
 
@@ -962,9 +965,17 @@ check_one_file_system_coverage() {
   done < /proc/self/mounts
 
   if (( ! ${#gap_targets[@]} )); then
-    # Cleared, so that the same set reappearing later pages immediately rather
-    # than waiting out a repeat interval left over from the last occurrence.
-    rm -f "$MOUNT_GAP_FILE" 2>/dev/null || true
+    # Records the CLEAN SCAN rather than removing the file. "No file" and
+    # "looked, found nothing" are different claims, and with the file gone
+    # --status could not tell them apart: it read a freshly deployed host as
+    # "all mounts covered" before any due run had scanned it, which
+    # FORCE_AFTER_HOURS can put a day away. Reporting healthy without having
+    # looked is the thing this series keeps taking out.
+    #
+    # An empty set still makes a recurrence page at once, which is what the rm
+    # was for: mount_gap_should_push compares SETS, and any gap differs from
+    # none, so the repeat interval is not inherited from the last occurrence.
+    (( REPORT_ONLY )) || write_state "$MOUNT_GAP_FILE" "$NOW" ""
     return 0
   fi
 
