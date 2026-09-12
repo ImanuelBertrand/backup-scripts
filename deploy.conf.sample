@@ -1,7 +1,15 @@
 # =============================================================================
-# deploy.conf -- which machines ./deploy.sh pushes to  (SAMPLE / template)
+# deploy.conf -- which machines ./deploy.sh pushes to
 # -----------------------------------------------------------------------------
-#     cp deploy.conf.sample deploy.conf     # then edit; deploy.conf is gitignored
+#     install -d -m 700 ~/.config/restic
+#     cp deploy.conf.sample ~/.config/restic/deploy.conf
+#     $EDITOR ~/.config/restic/deploy.conf
+#
+# It belongs in ~/.config/restic and not in the checkout: this describes one
+# production fleet, while the checkout is code -- cloned, cleaned, and checked
+# out a second time. deploy.sh reads that path alone (DEPLOY_CONF=... overrides
+# it) and refuses to run at all while a copy sits in the checkout, so an edit
+# cannot land in a file nothing loads.
 #
 # Nothing in here is secret, but it is site-specific: hostnames, paths, and the
 # cron minute each host gets. Sourced as plain bash.

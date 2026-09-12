@@ -1,4 +1,8 @@
 # Per-host secrets and site-specific settings -- never commit these.
 config
 encryption-pw
+
+# deploy.sh reads its host list from ~/.config/restic/deploy.conf. A copy here
+# is a leftover that nothing loads, and deploy.sh refuses to run while one
+# exists; this rule keeps such a leftover out of a commit in the meantime.
 deploy.conf

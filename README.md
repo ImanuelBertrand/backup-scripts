@@ -40,7 +40,7 @@ backup**, not the reason for the skip.
 | `pre-backup` | client, → `~/.config/restic/pre-backup` | **Optional** hook for what the config can't express. Omit if unneeded. |
 | `restic-backup.cron` | client, → `/etc/cron.d/restic-backup` | Hourly invocation. The **script** decides when to actually run. |
 | `deploy.sh` | admin machine (stays in the repo) | Pushes the files above to every host. Clients never pull. |
-| `deploy.conf.sample` | admin machine, → `deploy.conf` | Your host list, paths, and per-host cron minute. Gitignored. |
+| `deploy.conf.sample` | admin machine, → `~/.config/restic/deploy.conf` | Your host list, paths, and per-host cron minute. Lives outside the checkout. |
 | `docker-compose.yml` | backup host | The rest-server. |
 | `restic-maintenance.sh` | maintenance host, e.g. `/usr/local/sbin/` | Retention, prune, check and a restore smoke-test. Never runs on a client. |
 | `maintenance.config.sample` | maintenance host, → `~/.config/restic-maintenance/config` | Its settings **and secrets**. Hand-managed; `deploy.sh` never touches it. |
@@ -732,8 +732,9 @@ does on its own is *notice* that it is out of date.
 ### 10.1 Pushing
 
 ```bash
-cp deploy.conf.sample deploy.conf     # host list, paths, per-host cron minute
-$EDITOR deploy.conf
+install -d -m 700 ~/.config/restic    # host list, paths, per-host cron minute
+cp deploy.conf.sample ~/.config/restic/deploy.conf
+$EDITOR ~/.config/restic/deploy.conf
 
 ./deploy.sh                 # plan → diff → confirm → push → show each --status
 ./deploy.sh --dry-run       # plan and diff only
@@ -785,7 +786,20 @@ Two details worth knowing:
 - **A syntax error never leaves the repo.** `bash -n` runs on the local file
   before anything is pushed.
 
-`deploy.conf` is gitignored: it is not secret, but it is yours.
+`deploy.conf` lives in `~/.config/restic/`, not in the checkout. It is not
+secret, but it describes one production fleet, and a working tree is not where
+that belongs: a clone, a second worktree or a `git clean -xdf` each change what
+the tree holds, and none of them should be able to change, carry or drop the
+list of machines that get root-executed code pushed to them. `deploy.sh` reads
+that path alone — `DEPLOY_CONF=path ./deploy.sh` overrides it — and **refuses to
+run while a `deploy.conf` is left in the checkout**, rather than ignoring it:
+two files of the same name, one of them live, is how an edit ends up in the one
+nothing loads, and a deploy of the fleet the *other* file describes reports a
+clean success.
+
+Run `deploy.sh` as yourself. It needs no local root — the elevation it needs is
+on the target, through `SUDO` — and under `sudo` `$HOME` is root's, so the host
+list is looked for in `/root/.config/restic`.
 
 ### 10.2 Noticing drift
 

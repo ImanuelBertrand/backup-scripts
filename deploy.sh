@@ -29,6 +29,18 @@ set -euo pipefail
 #                    password prompt. Where root logs in directly, set
 #                    SSH_USER="root" and the sudo prefix drops out on its own.
 #
+# Where its config is:
+#                    ~/.config/restic/deploy.conf -- the host list, the target
+#                    paths, and the per-host cron minute. That is a description
+#                    of one production fleet, so it lives with the operator's
+#                    other settings and not in this checkout, which is code: a
+#                    clone, a second worktree or a `git clean -xdf` all change
+#                    what a working tree holds, and none of them should be able
+#                    to change, carry or drop the list of machines this pushes
+#                    root-executed code to. deploy.conf.sample here is its
+#                    template. Run this as yourself -- under sudo $HOME is
+#                    root's, and the file is looked for in /root/.config/restic.
+#
 #   ./deploy.sh                 plan, show diffs, ask, then apply
 #   ./deploy.sh --check         report each host's --status; alerts nobody
 #   ./deploy.sh --dry-run       plan and diff only
@@ -41,10 +53,18 @@ set -euo pipefail
 #                               to undo a hand-edit made on a target
 #   ALLOW_STALE=1 ./deploy.sh   push even though this checkout is behind its
 #                               git remote (normally a refusal)
+#   DEPLOY_CONF=path ./deploy.sh
+#                               use that file instead of the one above
 # ============================================================================
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONF="${DEPLOY_CONF:-$SRC_DIR/deploy.conf}"
+# Spelled the same way restic-backup.sh spells its own CONFIG_DIR, and not via
+# XDG_CONFIG_HOME: an admin machine is usually a client too, and "~/.config/
+# restic" has to mean one directory there, not one for the backup and another
+# for the deploys.
+CONF_DIR="$HOME/.config/restic"
+CONF="${DEPLOY_CONF:-$CONF_DIR/deploy.conf}"
+STRAY_CONF="$SRC_DIR/deploy.conf"
 
 CHECK_ONLY=0; DRY_RUN=0; ASSUME_YES=0; FORCE=0
 declare -a ONLY_HOSTS=()
@@ -65,7 +85,53 @@ while (( $# )); do
 done
 
 # ---- config ----
-[[ -f "$CONF" ]] || { echo "FATAL: no $CONF (copy deploy.conf.sample and edit it)" >&2; exit 1; }
+# A deploy.conf sitting in the checkout is not read, and is refused rather than
+# ignored. Two files with the same name, one of them live, is how an edit gets
+# made in the wrong one: the run then deploys the fleet the OTHER file
+# describes -- different hosts, different minutes, different target paths -- and
+# reports a clean success, because every host it did reach was updated exactly
+# as asked. Nothing downstream can notice a host that was never in the list.
+if [[ -e "$STRAY_CONF" ]] &&
+   [[ "$(readlink -f "$STRAY_CONF")" != "$(readlink -f "$CONF" 2>/dev/null)" ]]; then
+  cat >&2 <<EOF
+FATAL: $STRAY_CONF exists, and is not what this reads.
+
+The host list lives at
+    $CONF
+
+Move it, then re-run:
+
+    install -d -m 700 $CONF_DIR
+    mv $STRAY_CONF $CONF
+
+(Deliberately deploying from a file in the checkout: DEPLOY_CONF=$STRAY_CONF $0)
+EOF
+  exit 1
+fi
+
+if [[ ! -f "$CONF" ]]; then
+  {
+    echo "FATAL: no $CONF"
+    echo
+    echo "    install -d -m 700 $CONF_DIR"
+    echo "    cp $SRC_DIR/deploy.conf.sample $CONF"
+    echo "    \$EDITOR $CONF"
+    # sudo keeps its own HOME, so a run under sudo looks for the file in
+    # /root/.config/restic and reports it missing while it is sitting in the
+    # operator's home. Nothing here needs local root -- the elevation this tool
+    # needs is on the TARGET, through $SUDO.
+    if [[ -n "${SUDO_USER:-}" ]]; then
+      user_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+      if [[ -n "$user_home" && -f "$user_home/.config/restic/deploy.conf" ]]; then
+        echo
+        echo "  It is already at $user_home/.config/restic/deploy.conf."
+        echo "  This is running under sudo, so \$HOME is root's. deploy.sh needs no"
+        echo "  local root -- run it as $SUDO_USER."
+      fi
+    fi
+  } >&2
+  exit 1
+fi
 declare -A CRON_MINUTE=()
 SSH_USER="root"
 SUDO="sudo -n"
