@@ -67,7 +67,15 @@ set -euo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # ---- Arguments ----
-FORCE="${FORCE:-0}"
+# Read from RESTIC_BACKUP_FORCE, never from a bare FORCE. This runs from cron
+# on every host, and FORCE is a common enough name that a wrapper, a CI job or
+# an exporting parent shell could switch off the window, the min-interval and
+# the metered gate on every hourly run without anyone meaning to -- and the
+# only trace would be a log line reading "forced (--force)" for a run where no
+# flag was passed.
+FORCE="${RESTIC_BACKUP_FORCE:-0}"
+[[ "$FORCE" =~ ^[01]$ ]] || FORCE=0
+FORCE_SOURCE="RESTIC_BACKUP_FORCE"
 STATUS_ONLY=0
 CHECK_UPDATE_ONLY=0
 usage() {
@@ -83,7 +91,7 @@ USAGE
 }
 while (( $# )); do
   case "$1" in
-    -f|--force)        FORCE=1 ;;
+    -f|--force)        FORCE=1; FORCE_SOURCE="--force" ;;
     -s|--status)       STATUS_ONLY=1 ;;
     --check-update)    CHECK_UPDATE_ONLY=1 ;;
     -h|--help)         usage; exit 0 ;;
@@ -945,7 +953,7 @@ This run did not back up: $reason" "$age"
 
 DUE_REASON=""
 if (( FORCE )); then
-  DUE_REASON="forced (--force)"
+  DUE_REASON="forced ($FORCE_SOURCE)"
 elif (( SCHED_AGE_SEC < 0 )); then
   DUE_REASON="no successful backup on record"
 elif (( FORCE_AFTER_SEC > 0 && SCHED_AGE_SEC >= FORCE_AFTER_SEC )); then
