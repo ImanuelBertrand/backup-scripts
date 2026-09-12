@@ -55,24 +55,30 @@ export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 # ---- Arguments ----
 FORCE="${FORCE:-0}"
 STATUS_ONLY=0
+CHECK_UPDATE_ONLY=0
 usage() {
   cat <<'USAGE'
-Usage: restic-backup.sh [--force] [--status]
+Usage: restic-backup.sh [--force] [--status] [--check-update]
 
-  --force    back up now, ignoring the window / min-interval / metered gates
-             (the reachability gate still applies -- there is nowhere to push)
-  --status   print the scheduling decision and exit; changes nothing
+  --force         back up now, ignoring the window / min-interval / metered
+                  gates (reachability still applies -- nowhere to push to)
+  --status        print the scheduling decision and exit; changes nothing
+  --check-update  compare this file against the published version and report.
+                  NEVER downloads or installs anything -- deploy with deploy.sh
 USAGE
 }
 while (( $# )); do
   case "$1" in
-    -f|--force)  FORCE=1 ;;
-    -s|--status) STATUS_ONLY=1 ;;
-    -h|--help)   usage; exit 0 ;;
+    -f|--force)        FORCE=1 ;;
+    -s|--status)       STATUS_ONLY=1 ;;
+    --check-update)    CHECK_UPDATE_ONLY=1 ;;
+    -h|--help)         usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 
 # ---- Small helpers (needed while validating the config) ----
 log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*"; }
@@ -117,6 +123,12 @@ FORCE_AFTER_HOURS="${FORCE_AFTER_HOURS:-24}"
 MAX_BACKUP_AGE_HOURS="${MAX_BACKUP_AGE_HOURS:-36}"   # 0 = never hard-fail on age
 NOTIFY_REPEAT_HOURS="${NOTIFY_REPEAT_HOURS:-12}"     # re-page interval while stale
 
+# Version drift. REPORT ONLY -- this script never downloads or installs code.
+# Knowing which host is running an old copy is the whole point; updating is
+# deploy.sh's job, from a machine you are sitting at.
+VERSION_CHECK_URL="${VERSION_CHECK_URL:-}"           # "" = disabled
+VERSION_CHECK_INTERVAL_HOURS="${VERSION_CHECK_INTERVAL_HOURS:-24}"
+
 # WireGuard self-heal: bounce the tunnel once if the backend is unreachable.
 WG_INTERFACE="${WG_INTERFACE:-}"                     # "" = never touch the tunnel
 WG_RESTART_CMD="${WG_RESTART_CMD:-}"                 # overrides the built-in logic
@@ -128,7 +140,8 @@ if declare -p SKIP_IF_UNREACHABLE &>/dev/null; then
   log "WARN: becomes a failure. Delete it from $CONFIG_DIR/config."
 fi
 
-for _v in MIN_INTERVAL_HOURS FORCE_AFTER_HOURS MAX_BACKUP_AGE_HOURS NOTIFY_REPEAT_HOURS WG_SETTLE_SECS; do
+for _v in MIN_INTERVAL_HOURS FORCE_AFTER_HOURS MAX_BACKUP_AGE_HOURS NOTIFY_REPEAT_HOURS \
+          VERSION_CHECK_INTERVAL_HOURS WG_SETTLE_SECS; do
   declare -n _r="$_v"
   if [[ ! "$_r" =~ ^[0-9]+$ ]]; then log "WARN: $_v='$_r' is not an integer; using 0"; _r=0; fi
 done
@@ -138,6 +151,7 @@ MIN_INTERVAL_SEC=$(( MIN_INTERVAL_HOURS * 3600 ))
 FORCE_AFTER_SEC=$(( FORCE_AFTER_HOURS * 3600 ))
 MAX_AGE_SEC=$(( MAX_BACKUP_AGE_HOURS * 3600 ))
 NOTIFY_REPEAT_SEC=$(( NOTIFY_REPEAT_HOURS * 3600 ))
+VERSION_CHECK_INTERVAL_SEC=$(( VERSION_CHECK_INTERVAL_HOURS * 3600 ))
 
 # The hard-fail threshold must sit ABOVE the catch-up threshold, or the script
 # pages you about a backup it was never going to attempt yet.
@@ -151,11 +165,13 @@ fi
 LAST_SUCCESS_FILE="$CONFIG_DIR/.last-success"
 FIRST_SEEN_FILE="$CONFIG_DIR/.first-seen"
 NOTIFY_STATE_FILE="$CONFIG_DIR/.notify-state"
+VERSION_STATE_FILE="$CONFIG_DIR/.version-state"
 ALERT_AGE_SEC=-1                       # set for real below; safe default for the ERR trap
 
 # ntfy (failure-only; success is intentionally silent)
 NTFY_URL="${NTFY_URL:-}"
 NTFY_TOPIC_HIGH="${NTFY_TOPIC_HIGH:-backups-high}"
+NTFY_TOPIC_LOW="${NTFY_TOPIC_LOW:-}"                 # "" = drift is log-only
 NTFY_TOKEN="${NTFY_TOKEN:-}"
 PING_URL="${RESTIC_PING_URL:-}"
 
@@ -168,6 +184,87 @@ ntfy() {
   [[ -n "$NTFY_TOKEN" ]] && args+=(-H "Authorization: Bearer $NTFY_TOKEN")
   curl -fsS -m 15 --retry 3 "${args[@]}" --data-binary "$body" \
     "$NTFY_URL/$topic" >/dev/null 2>&1 || log "WARN: ntfy send failed"
+}
+
+# ---- Version drift -------------------------------------------------------
+# Compares THIS FILE against the published one and says so. It does not fetch
+# code to run, and deliberately has no path that writes to $SELF_PATH: the
+# script runs as root on every host, so an auto-updater would turn one GitHub
+# credential into fleet-wide root. Updating is a push from deploy.sh, by a
+# human. See README section 10.
+#
+# Strictly advisory: it runs only AFTER a successful backup, every failure in
+# here is swallowed, and nothing it does can delay or block a backup.
+sha256_of() {
+  if   command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  elif command -v openssl   >/dev/null 2>&1; then openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'
+  else return 1; fi
+}
+
+# state file: "<checked_epoch> <remote_sha> <notified_sha>"
+_version_state() {
+  local checked=0 remote="-" notified="-"
+  if [[ -s "$VERSION_STATE_FILE" ]]; then
+    read -r checked remote notified < "$VERSION_STATE_FILE" || true
+    [[ "$checked" =~ ^[0-9]+$ ]] || checked=0
+  fi
+  printf '%s %s %s' "$checked" "${remote:--}" "${notified:--}"
+}
+
+version_check() {                      # $1 = "force" to ignore the interval
+  [[ -n "$VERSION_CHECK_URL" ]] || return 0
+  local now checked remote_sha notified_sha local_sha tmp
+  now=$(date +%s)
+  read -r checked remote_sha notified_sha <<<"$(_version_state)"
+  if [[ "${1:-}" != force ]] && (( VERSION_CHECK_INTERVAL_SEC > 0 )) \
+     && (( now - checked < VERSION_CHECK_INTERVAL_SEC )); then
+    return 0
+  fi
+  local_sha="$(sha256_of "$SELF_PATH")" || { log "NOTICE: no sha256 tool; version check skipped"; return 0; }
+  [[ -n "$local_sha" ]] || return 0
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  if ! curl -fsS -m 20 "$VERSION_CHECK_URL" -o "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; log "NOTICE: version check could not reach $VERSION_CHECK_URL (ignored)"; return 0
+  fi
+  # A captive portal answers 200 with HTML, which -f will not catch.
+  if ! head -n1 "$tmp" | grep -q '^#!/bin/bash'; then
+    rm -f "$tmp"; log "NOTICE: version check got something that is not the script (ignored)"; return 0
+  fi
+  remote_sha="$(sha256_of "$tmp")" || { rm -f "$tmp"; return 0; }
+  rm -f "$tmp"
+  printf '%s %s %s\n' "$now" "$remote_sha" "$notified_sha" > "$VERSION_STATE_FILE"
+
+  [[ "$local_sha" == "$remote_sha" ]] && return 0
+
+  log "WARN: this host is NOT running the published version of restic-backup.sh"
+  log "WARN:   local  ${local_sha:0:12}   remote ${remote_sha:0:12}   ($VERSION_CHECK_URL)"
+  log "WARN:   deploy with ./deploy.sh -- this host will not update itself"
+  if [[ -n "$NTFY_TOPIC_LOW" && "$remote_sha" != "$notified_sha" ]]; then
+    ntfy "$NTFY_TOPIC_LOW" low arrows_counterclockwise \
+      "Backup script out of date on $(hostname)" \
+"Host:   $(hostname)
+Local:  ${local_sha:0:12}
+Remote: ${remote_sha:0:12}
+Source: $VERSION_CHECK_URL
+
+Nothing was changed -- deploy with ./deploy.sh."
+    printf '%s %s %s\n' "$now" "$remote_sha" "$remote_sha" > "$VERSION_STATE_FILE"
+  fi
+  return 0
+}
+
+# One line for --status. Reads the last recorded result; never touches network.
+version_status() {
+  [[ -n "$VERSION_CHECK_URL" ]] || { printf 'check disabled (VERSION_CHECK_URL unset)'; return; }
+  local checked remote notified local_sha
+  read -r checked remote notified <<<"$(_version_state)"
+  if (( checked == 0 )) || [[ "$remote" == "-" ]]; then printf 'not checked yet'; return; fi
+  local_sha="$(sha256_of "$SELF_PATH")" || { printf 'unknown (no sha256 tool)'; return; }
+  if [[ "$local_sha" == "$remote" ]]; then
+    printf 'matches published (checked %s ago)' "$(fmt_age $(( $(date +%s) - checked )))"
+  else
+    printf 'DIFFERS from published -- local %s, remote %s' "${local_sha:0:12}" "${remote:0:12}"
+  fi
 }
 
 # Hourly invocation means a stuck host would push 24 urgent notifications a day.
@@ -446,7 +543,14 @@ if (( STATUS_ONLY )); then
     "$MIN_INTERVAL_HOURS" "$FORCE_AFTER_HOURS" "$MAX_BACKUP_AGE_HOURS"
   printf 'stale        : %s\n' \
     "$( (( MAX_AGE_SEC > 0 && ALERT_AGE_SEC >= MAX_AGE_SEC )) && echo 'YES -- would alert' || echo no )"
+  printf 'version      : %s\n' "$(version_status)"
   printf 'decision     : %s\n' "${DUE_REASON:-not due, would skip}"
+  exit 0
+fi
+
+if (( CHECK_UPDATE_ONLY )); then
+  version_check force
+  printf 'version : %s\n' "$(version_status)"
   exit 0
 fi
 
@@ -588,3 +692,7 @@ rm -f "$NOTIFY_STATE_FILE"            # failure streak is over; next failure pag
 
 log "Backup complete."
 ping_dms "$PING_URL"
+
+# Advisory only, and last on purpose: the backup is already done and reported,
+# so nothing here can affect it.
+version_check

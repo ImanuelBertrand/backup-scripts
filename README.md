@@ -362,6 +362,7 @@ decision     : not due, would skip
 journalctl -t restic-backup -n 50        # what cron actually ran
 journalctl -t restic-backup | grep 'WG:' # tunnel restarts (see 2.1)
 restic-backup.sh --force                 # run now, ignoring every gate
+restic-backup.sh --check-update          # am I running the published version? (§10)
 ```
 
 ### 4.5 Migrating from the old schedule
@@ -539,6 +540,7 @@ can read a repo given those three, which is why §3.2 matters.
 |---|---|---|
 | ntfy (`urgent`) | First failure after a success; crossing `MAX_BACKUP_AGE_HOURS`; then every `NOTIFY_REPEAT_HOURS` | Success is intentionally silent. Throttled — see §4.3. |
 | Local staleness check | Every invocation, including every skip | The fast alarm: catches a host that is alive but quietly not backing up. |
+| ntfy (`low`) | Once per newly published script version, if this host is behind | Only when `NTFY_TOPIC_LOW` is set; otherwise a log line. Never updates anything — see §10. |
 | healthchecks ping | `/start`, success, `/fail` | The slow alarm: catches a host too dead to alert for itself. Grace period should sit **above** `MAX_BACKUP_AGE_HOURS`. |
 | `notify-send` | Failure, desktop only | Best-effort. |
 
@@ -576,6 +578,8 @@ Then let a real run repair it, or delete `.last-success` to reset.
 | Dump fails, whole backup aborts | Intended. Fix the dump — don't disable the check. |
 | `no mariadb-dump/pg_dumpall in container` | `DOCKER_AUTO` on a SQLite container. Use `SQLITE_FILES` with the host path, or the hook. |
 | Alert fires but no desktop popup | `notify-send` from a root cron job can't reach your session. The ntfy message is the real channel. |
+| `this host is NOT running the published version` | Version drift. Nothing is broken and nothing was changed; push with `./deploy.sh`. |
+| `version check could not reach …` | GitHub was unreachable. Advisory only — it runs after the backup and cannot affect it. |
 | Exclude pattern silently ignored | restic treats `#` as a comment **only** at the start of a line. An inline comment becomes part of the pattern. |
 
 ---
@@ -585,7 +589,10 @@ Then let a real run repair it, or delete `.last-success` to reset.
 Clients **never fetch code**. `restic-backup.sh` runs as root on every host, so
 a fetch-and-exec updater would turn one GitHub credential — or one bad commit to
 `main` — into root on the whole fleet, arriving within the hour now that cron
-runs hourly. Updates are pushed by a human instead.
+runs hourly. Updates are pushed by a human instead; the only thing the client
+does on its own is *notice* that it is out of date.
+
+### 10.1 Pushing
 
 ```bash
 cp deploy.conf.sample deploy.conf     # host list, paths, per-host cron minute
@@ -613,6 +620,25 @@ Two details worth knowing:
   before anything is pushed.
 
 `deploy.conf` is gitignored: it is not secret, but it is yours.
+
+### 10.2 Noticing drift
+
+Set `VERSION_CHECK_URL` in each client's config and the script compares itself
+against the published copy — after a successful backup, at most once every
+`VERSION_CHECK_INTERVAL_HOURS`, with every error swallowed. It can neither delay
+nor block a backup, and it has no code path that writes to itself.
+
+```console
+# restic-backup.sh --check-update
+version : DIFFERS from published -- local 975f2f8641ee, remote c99352ec3c19
+```
+
+Drift is logged on every run, shown in `--status`, and — if you set
+`NTFY_TOPIC_LOW` — pushed once per newly published version, so publishing a
+change nudges you once per stale host rather than once per run.
+
+`./deploy.sh --check` gives you the same answer for the whole fleet at once,
+which is usually what you actually want.
 
 ---
 

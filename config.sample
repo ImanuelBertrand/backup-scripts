@@ -146,12 +146,29 @@ WG_INTERFACE=""                                    # e.g. "wg0"
 # Your ntfy base URL (self-hosted or https://ntfy.sh). No trailing slash.
 NTFY_URL="https://ntfy.example.com"
 NTFY_TOPIC_HIGH="backups-high"                     # topic for urgent failures
+NTFY_TOPIC_LOW=""                                  # topic for version drift; "" = log only
 NTFY_TOKEN="CHANGE-ME"                             # SECRET -- do not commit; "" if topic is open
 
 # ---- Dead-man's-switch ping (healthchecks.io or self-hosted) ----------------
 # Script pings $URL/start at begin, $URL on success, $URL/fail on failure. If
 # the pings stop, the service alerts you. Leave empty ("") to disable.
 RESTIC_PING_URL="https://hc-ping.com/CHANGE-ME"    # treat as a secret -- do not commit
+
+# ---- Version drift (report only -- nothing here ever updates the script) ----
+# Compares the installed restic-backup.sh against the published one and says so
+# in the log, in --status, and (if NTFY_TOPIC_LOW is set) with ONE low-priority
+# push per newly published version. It answers "which host is running an old
+# copy?", which is the only part of self-updating worth having.
+#
+# It deliberately cannot install anything. The script runs as root on every
+# host: a fetch-and-exec would turn one GitHub credential into fleet-wide root,
+# and with an hourly schedule it would land within the hour. Updates are pushed
+# by ./deploy.sh, from a machine you are sitting at.
+#
+# The check runs only AFTER a successful backup, never before, and every error
+# in it is swallowed -- it can neither delay nor block a backup. "" disables it.
+VERSION_CHECK_URL="https://raw.githubusercontent.com/ImanuelBertrand/backup-scripts/refs/heads/main/restic-backup.sh"
+VERSION_CHECK_INTERVAL_HOURS="24"
 
 # ---- Misc -------------------------------------------------------------------
 # How long `restic backup` waits for a held repo lock (e.g. during maintenance
