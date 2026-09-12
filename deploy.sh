@@ -86,6 +86,17 @@ warn_no_cron() {
   printf '  up and nothing will alert about it. Add a minute for each in %s.\n' "$CONF" >&2
 }
 
+# Same class of problem as a missing CRON_MINUTE: the deploy succeeds, --status
+# looks like a fresh install, and the host never backs up. Reported, not
+# enforced -- a first deploy legitimately lands before the hand-managed config.
+warn_prereqs() {
+  (( ${#PREREQ[@]} )) || return 0
+  printf '\nWARNING: missing prerequisites on:\n' >&2
+  local k
+  for k in "${!PREREQ[@]}"; do printf '  %-20s %s\n' "$k" "${PREREQ[$k]}" >&2; done
+  printf '  Each of these installs cleanly and then backs nothing up.\n' >&2
+}
+
 addr_of() { [[ "$1" == *@* ]] && printf '%s' "$1" || printf '%s@%s' "$SSH_USER" "$1"; }
 sha_of()  { sha256sum "$1" | awk '{print $1}'; }
 
@@ -112,7 +123,8 @@ if (( CHECK_ONLY )); then
   rc=0
   for h in "${HOSTS[@]}"; do
     printf '\n=== %s ===\n' "$h"
-    if ! ssh "${SSH_OPTS[@]}" "$(addr_of "$h")" "'$SBIN_PATH' --status" 2>&1; then
+    if ! ssh -n "${SSH_OPTS[@]}" "$(addr_of "$h")" \
+         "RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" 2>&1; then
       echo "  no status: unreachable, not installed, or no config"; rc=1
     fi
   done
@@ -130,14 +142,25 @@ fi
 # ---- pass 1: plan ----
 local_sh="$(sha_of "$SRC_DIR/restic-backup.sh")"
 local_ex="$(sha_of "$SRC_DIR/excludes")"
-declare -A PLAN=() CRONTMP=()
+declare -A PLAN=() CRONTMP=() PREREQ=()
 pending=0; unreachable=()
 
 for h in "${HOSTS[@]}"; do
   addr="$(addr_of "$h")"
-  remote="$(ssh "${SSH_OPTS[@]}" "$addr" \
-      "sha256sum '$SBIN_PATH' '$CONFIG_DIR/excludes' '$CRON_PATH' 2>/dev/null; true" 2>/dev/null)" || {
+  # One round trip does the checksums AND the prerequisites. None of these block
+  # a push -- a first deploy legitimately precedes the hand-managed config -- but
+  # every one of them is a host that installs cleanly and then never backs up,
+  # which is the failure this tool is least able to notice afterwards.
+  remote="$(ssh -n "${SSH_OPTS[@]}" "$addr" "
+      sha256sum $(rq "$SBIN_PATH") $(rq "$CONFIG_DIR/excludes") $(rq "$CRON_PATH") 2>/dev/null
+      command -v restic >/dev/null 2>&1 || echo '#PRE restic is not installed'
+      command -v flock  >/dev/null 2>&1 || echo '#PRE flock is missing (util-linux)'
+      [ -f $(rq "$CONFIG_DIR/config") ]        || echo '#PRE no config'
+      [ -r $(rq "$CONFIG_DIR/encryption-pw") ] || echo '#PRE no encryption-pw'
+      true" 2>/dev/null)" || {
     unreachable+=("$h"); PLAN[$h]="unreachable"; continue; }
+  prereq="$(sed -n 's/^#PRE //p' <<<"$remote" | paste -sd, - | sed 's/,/, /g')"
+  [[ -n "$prereq" ]] && PREREQ[$h]="$prereq"
   r_sh=$(awk -v p="$SBIN_PATH"            '$2==p{print $1}' <<<"$remote")
   r_ex=$(awk -v p="$CONFIG_DIR/excludes"  '$2==p{print $1}' <<<"$remote")
   r_cr=$(awk -v p="$CRON_PATH"            '$2==p{print $1}' <<<"$remote")
@@ -161,6 +184,7 @@ for h in "${HOSTS[@]}"; do
 done
 (( ${#unreachable[@]} )) && printf '\n%d host(s) unreachable: %s\n' "${#unreachable[@]}" "${unreachable[*]}"
 warn_no_cron
+warn_prereqs
 
 if (( pending == 0 )); then
   echo; echo "Nothing to do."
@@ -284,7 +308,8 @@ for h in "${HOSTS[@]}"; do
       || { ok=0; echo "  FAILED to push $CRON_PATH -- this host has no schedule"; }
   fi
   if (( ok )); then
-    ssh -n "${SSH_OPTS[@]}" "$addr" "$(rq "$SBIN_PATH") --status" \
+    ssh -n "${SSH_OPTS[@]}" "$addr" \
+        "RESTIC_CONFIG_DIR=$(rq "$CONFIG_DIR") $(rq "$SBIN_PATH") --status" \
       || { echo "  (--status failed)"; rc=1; }
   else
     rc=1
