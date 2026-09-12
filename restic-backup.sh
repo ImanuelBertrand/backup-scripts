@@ -1078,11 +1078,24 @@ wg_bounce() {
     log "WG: already bounced $(fmt_age "$since") ago; waiting (WG_BOUNCE_INTERVAL_HOURS=$WG_BOUNCE_INTERVAL_HOURS)."
     return 1
   fi
-  write_state "$WG_BOUNCE_FILE" "$NOW"
 
+  # The interval slot is spent by a bounce that RAN, not by one we merely
+  # reached the decision to attempt. Recording it up front meant that the one
+  # outcome needing another attempt soonest -- `down` succeeded, `up` failed,
+  # tunnel now fully DOWN, as the log below says -- was also the one guaranteed
+  # not to get one for WG_BOUNCE_INTERVAL_HOURS, even though re-running `up` is
+  # the only thing that recovers it. A restart mechanism that is simply absent
+  # never spends the slot either.
+  #
+  # So each path below records its own attempt on success. A mechanism that
+  # fails every hour therefore retries every hour: noisier than the old
+  # behaviour, but it is a broken restart command or a vanished interface,
+  # logged every time, not the "endpoint down for two days" case the interval
+  # exists for -- that one bounces cleanly and is still rate-limited.
   if [[ -n "$WG_RESTART_CMD" ]]; then
     log "WG: running WG_RESTART_CMD"
     if ! bash -c "$WG_RESTART_CMD" 9>&-; then log "WG: WG_RESTART_CMD failed."; return 1; fi
+    write_state "$WG_BOUNCE_FILE" "$NOW"
     sleep "$WG_SETTLE_SECS"; return 0
   fi
   # Never run wg-quick behind systemd's back: it would leave the unit thinking
@@ -1101,6 +1114,7 @@ wg_bounce() {
     log "WG: neither a wg-quick@$WG_INTERFACE unit nor a wg-quick binary; cannot restart."
     return 1
   fi
+  write_state "$WG_BOUNCE_FILE" "$NOW"
   sleep "$WG_SETTLE_SECS"
   return 0
 }
