@@ -812,6 +812,29 @@ directory from $CONFIG_DIR/config, which is sourced with a verified owner:
     export PATH=\"/snap/bin:\$PATH\""
 }
 
+# curl is as load-bearing here as restic and flock, and was the only one of the
+# three never checked. All THREE of the things that make a skip safe go through
+# it: REST_HEALTH_URL (backend_reachable), RESTIC_PING_URL (the dead-man's
+# switch) and NTFY_URL (the page). Miss it and backend_reachable fails on every
+# run, so every run stale_exit()s -- and neither the local alert nor the DMS
+# ping can be sent to say why. The host stops backing up, the only local trace
+# is a log line, and detection falls back to the external switch noticing an
+# absence a grace period later: exactly the outcome the local alerting exists
+# to replace.
+#
+# Checked only where it is actually used, since a host with none of the three
+# configured genuinely does not need it.
+check_curl_present() {
+  [[ -n "${REST_HEALTH_URL:-}${PING_URL}${NTFY_URL}" ]] || return 0
+  command -v curl >/dev/null 2>&1 || preflight_fail \
+"curl is not on this script's PATH ($PATH), and this host is configured to use
+it: REST_HEALTH_URL, RESTIC_PING_URL and NTFY_URL all go through curl.
+Without it the backend always reads as unreachable, so every run skips -- and
+neither the local alert nor the dead-man's-switch ping can report that.
+Install curl, or add its directory from $CONFIG_DIR/config:
+    export PATH=\"/opt/bin:\$PATH\""
+}
+
 check_backup_sources() {
   local p
   for p in "${BACKUP_PATHS[@]}"; do
@@ -1076,6 +1099,7 @@ log "Due: $DUE_REASON"
 # unmounted is a reason to page, but not a reason to page on an hour we were
 # going to skip anyway.
 check_restic_present
+check_curl_present
 check_backup_sources
 check_one_file_system_coverage
 

@@ -169,6 +169,7 @@ prereq_probe() {
   cat <<EOF
 command -v restic >/dev/null 2>&1 || echo '#PRE restic is not installed'
 command -v flock  >/dev/null 2>&1 || echo '#PRE flock is missing (util-linux)'
+command -v curl   >/dev/null 2>&1 || echo '#PRE curl is missing (health check, ntfy, dead-mans switch)'
 [ -f $(rq "$CONFIG_DIR/config") ]        || echo '#PRE no config'
 [ -r $(rq "$CONFIG_DIR/encryption-pw") ] || echo '#PRE no encryption-pw'
 EOF
