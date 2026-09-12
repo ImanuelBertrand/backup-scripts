@@ -37,6 +37,8 @@ backup**, not the reason for the skip.
 | `excludes` | client, → `~/.config/restic/excludes` | Shared exclude patterns. No secrets; committed. |
 | `pre-backup` | client, → `~/.config/restic/pre-backup` | **Optional** hook for what the config can't express. Omit if unneeded. |
 | `restic-backup.cron` | client, → `/etc/cron.d/restic-backup` | Hourly invocation. The **script** decides when to actually run. |
+| `deploy.sh` | admin machine (stays in the repo) | Pushes the files above to every host. Clients never pull. |
+| `deploy.conf.sample` | admin machine, → `deploy.conf` | Your host list, paths, and per-host cron minute. Gitignored. |
 | `docker-compose.yml` | backup host | The rest-server. |
 
 ## Prerequisites
@@ -578,6 +580,42 @@ Then let a real run repair it, or delete `.last-success` to reset.
 
 ---
 
+## 10. Updating the fleet
+
+Clients **never fetch code**. `restic-backup.sh` runs as root on every host, so
+a fetch-and-exec updater would turn one GitHub credential — or one bad commit to
+`main` — into root on the whole fleet, arriving within the hour now that cron
+runs hourly. Updates are pushed by a human instead.
+
+```bash
+cp deploy.conf.sample deploy.conf     # host list, paths, per-host cron minute
+$EDITOR deploy.conf
+
+./deploy.sh                 # plan → diff → confirm → push → show each --status
+./deploy.sh --dry-run       # plan and diff only
+./deploy.sh --check         # change nothing; print every host's --status
+./deploy.sh --host srv01    # one host (repeatable)
+```
+
+It deploys `restic-backup.sh`, `excludes`, and the cron entry — rendering the
+latter with **that host's own minute** from `CRON_MINUTE`, which is the easiest
+way to keep the fleet staggered. It never touches `config`, `encryption-pw`, or
+`pre-backup`: those are per-host, hand-managed, and two of them are secrets.
+
+Two details worth knowing:
+
+- **It installs by rename, not by copy.** `restic-backup.sh` may be running when
+  you deploy, and bash reads its own source incrementally as it executes —
+  overwriting it in place makes a live run execute whatever happens to land at
+  the offset it reads next. `deploy.sh` writes `<dest>.new` and `mv`s it over,
+  so a running backup keeps its original inode and finishes normally.
+- **A syntax error never leaves the repo.** `bash -n` runs on the local file
+  before anything is pushed.
+
+`deploy.conf` is gitignored: it is not secret, but it is yours.
+
+---
+
 ## Security model
 
 | Control | Protects against |
@@ -589,6 +627,7 @@ Then let a real run repair it, or delete `.last-success` to reset.
 | `:ro` auth mount, `no-new-privileges` | A compromised rest-server container rewriting credentials or escalating. |
 | `$DUMP_DIR` wiped on exit, mode `0700` | Plaintext database dumps lingering on client disks. |
 | Secrets via env / container env, never argv | Passwords appearing in the host process list. |
+| No self-update path; clients never fetch code | One compromised GitHub credential becoming root on every host within the hour. |
 
 Not covered: the maintenance host is a single point of trust — it holds every
 encryption password and has delete rights on every repo. If that matters for

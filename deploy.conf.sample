@@ -1,0 +1,50 @@
+# =============================================================================
+# deploy.conf -- which machines ./deploy.sh pushes to  (SAMPLE / template)
+# -----------------------------------------------------------------------------
+#     cp deploy.conf.sample deploy.conf     # then edit; deploy.conf is gitignored
+#
+# Nothing in here is secret, but it is site-specific: hostnames, paths, and the
+# cron minute each host gets. Sourced as plain bash.
+# =============================================================================
+
+# Every entry is passed to ssh/scp verbatim, so a bare hostname, a
+# ~/.ssh/config alias, or "user@host" all work.
+HOSTS=(
+  srv01
+  srv02
+  pc.lan
+  laptop.lan
+)
+
+# Prepended when a HOSTS entry has no "user@". Root is required on the target:
+# deploy.sh writes to /usr/local/sbin and /etc/cron.d.
+SSH_USER="root"
+
+# BatchMode makes an unreachable or passphrase-prompting host fail fast instead
+# of hanging the whole run.
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
+
+# ---- Where things live ON THE TARGET ----------------------------------------
+SBIN_PATH="/usr/local/sbin/restic-backup.sh"
+CONFIG_DIR="/root/.config/restic"
+CRON_PATH="/etc/cron.d/restic-backup"
+
+# ---- Per-host cron minute ---------------------------------------------------
+# A host listed here gets restic-backup.cron rendered with ITS minute (and the
+# paths above) and installed. A host NOT listed keeps whatever cron entry it
+# already has -- deploy.sh will not touch it.
+#
+# GIVE EVERY HOST A DIFFERENT VALUE. It staggers them off the repo lock, and
+# unlike a random delay you can see the whole fleet's spread right here.
+declare -A CRON_MINUTE=(
+  [srv01]=07
+  [srv02]=23
+  [pc.lan]=41
+  [laptop.lan]=53
+)
+
+# -----------------------------------------------------------------------------
+# NEVER deployed, by design:
+#   config, encryption-pw  -- secrets, different on every host, hand-managed
+#   pre-backup             -- per-host hook, hand-managed
+# -----------------------------------------------------------------------------

@@ -1,0 +1,4 @@
+# Per-host secrets and site-specific settings -- never commit these.
+config
+encryption-pw
+deploy.conf
