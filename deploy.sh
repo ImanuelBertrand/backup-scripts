@@ -134,6 +134,31 @@ sha_of()  { sha256sum "$1" | awk '{print $1}'; }
 # command on the far side.
 rq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
+# Pick one path's hash out of a `sha256sum a b c` run.
+#
+# NOT `awk '$2==p'`: sha256sum separates the hash from the name with TWO spaces
+# and does not escape a space INSIDE the name, so for /opt/a b/f.sh the second
+# field is "/opt/a" and the match never fires. The hash then came back empty,
+# compared unequal to the local one, and the host was reported as needing that
+# file on every single run and re-pushed forever. rq() was added so these paths
+# survive the ssh boundary; this is the other half of that.
+#
+# Match on the fixed-width hash and on the exact remainder of the line instead.
+# A name containing a backslash makes sha256sum escape the line and prefix it
+# with '\', so that marker is stripped and '\\' undone first. (A name with a
+# newline in it cannot be recognised line-wise at all, and cannot be a script
+# or cron path here.) Written without regex intervals, which mawk and busybox
+# awk have not always supported.
+remote_sha() {                         # remote_sha <sha256sum-output> <path>
+  awk -v p="$2" '
+    /^\\/ { sub(/^\\/, ""); gsub(/\\\\/, "\\") }
+    length($0) > 66 &&
+    (substr($0, 65, 2) == "  " || substr($0, 65, 2) == " *") &&
+    substr($0, 1, 64) ~ /^[0-9a-f]+$/ &&
+    substr($0, 67) == p { print substr($0, 1, 64) }
+  ' <<<"$1"
+}
+
 # Rewrite the shipped cron template for ONE host: its own minute, and whatever
 # paths deploy.conf uses.
 render_cron() {
@@ -208,9 +233,9 @@ for h in "${HOSTS[@]}"; do
     unreachable+=("$h"); PLAN[$h]="unreachable"; continue; }
   prereq="$(sed -n 's/^#PRE //p' <<<"$remote" | paste -sd, - | sed 's/,/, /g')"
   [[ -n "$prereq" ]] && PREREQ[$h]="$prereq"
-  r_sh=$(awk -v p="$SBIN_PATH"            '$2==p{print $1}' <<<"$remote")
-  r_ex=$(awk -v p="$CONFIG_DIR/excludes"  '$2==p{print $1}' <<<"$remote")
-  r_cr=$(awk -v p="$CRON_PATH"            '$2==p{print $1}' <<<"$remote")
+  r_sh=$(remote_sha "$remote" "$SBIN_PATH")
+  r_ex=$(remote_sha "$remote" "$CONFIG_DIR/excludes")
+  r_cr=$(remote_sha "$remote" "$CRON_PATH")
 
   acts=""
   [[ "$r_sh" == "$local_sh" ]] && (( ! FORCE )) || acts+=" script"
