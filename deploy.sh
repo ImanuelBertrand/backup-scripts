@@ -155,6 +155,9 @@ if (( CHECK_ONLY )); then
     fi
   done
   warn_no_cron
+  # A fleet with unscheduled hosts is not healthy, so --check must not exit 0 on
+  # it -- that is the whole point of a mode meant to be run from CI.
+  (( ${#NO_CRON[@]} )) && rc=1
   exit "$rc"
 fi
 
@@ -169,7 +172,18 @@ fi
 local_sh="$(sha_of "$SRC_DIR/restic-backup.sh")"
 local_ex="$(sha_of "$SRC_DIR/excludes")"
 declare -A PLAN=() CRONTMP=() PREREQ=()
-pending=0; unreachable=()
+pending=0; unreachable=(); CURRENT_HOST=""
+# The four hand-written cleanup loops this replaces all missed the "Not a
+# terminal; re-run with --yes" exit, and any abort from set -e or Ctrl-C.
+cleanup_tmp() { rm -f ${CRONTMP[@]+"${CRONTMP[@]}"}; }
+trap cleanup_tmp EXIT
+# An interrupt between two pushes leaves a host half-deployed, and nothing
+# records which one. Say so rather than leaving it to be discovered.
+trap 'if [[ -n "$CURRENT_HOST" ]]; then
+        printf "\n\nINTERRUPTED while deploying to %s -- that host may be half-updated.\n" "$CURRENT_HOST" >&2
+        printf "Re-run ./deploy.sh --host %s to finish it.\n" "$CURRENT_HOST" >&2
+      fi
+      exit 130' INT TERM
 
 for h in "${HOSTS[@]}"; do
   addr="$(addr_of "$h")"
@@ -199,7 +213,9 @@ for h in "${HOSTS[@]}"; do
     [[ "$r_cr" == "$(sha_of "$tmp")" ]] && (( ! FORCE )) || acts+=" cron"
   fi
   PLAN[$h]="${acts# }"
-  [[ -n "${PLAN[$h]}" ]] && pending=$(( pending + 1 ))
+  # "unreachable" is a non-empty PLAN entry but not work: counting it made a run
+  # in which every host was down skip "Nothing to do" and prompt to push nothing.
+  [[ -n "${PLAN[$h]}" && "${PLAN[$h]}" != unreachable ]] && pending=$(( pending + 1 ))
 done
 
 printf '\n%-22s %s\n' "HOST" "TO UPDATE"
@@ -214,7 +230,6 @@ warn_prereqs
 
 if (( pending == 0 )); then
   echo; echo "Nothing to do."
-  for t in "${CRONTMP[@]}"; do rm -f "$t"; done
   (( ${#unreachable[@]} )) && exit 1; exit 0
 fi
 
@@ -265,15 +280,15 @@ show_diffs() {
 
 if (( DRY_RUN )); then
   show_diffs
-  for t in "${CRONTMP[@]}"; do rm -f "$t"; done
-  exit 0
+  # Non-zero if anything could not be planned, so --dry-run is usable as a gate.
+  (( ${#unreachable[@]} )) && exit 1; exit 0
 fi
 
 if (( ! ASSUME_YES )); then
   [[ -t 0 ]] || { echo "Not a terminal; re-run with --yes." >&2; exit 1; }
   show_diffs
   read -r -p $'\nPush to the hosts listed above? [y/N] ' ans
-  [[ "$ans" == [yY]* ]] || { echo "Aborted."; for t in "${CRONTMP[@]}"; do rm -f "$t"; done; exit 1; }
+  [[ "$ans" == [yY]* ]] || { echo "Aborted."; exit 1; }
 fi
 
 # ---- pass 2: apply ----
@@ -308,7 +323,7 @@ push() {                               # push <local> <remote-dest> <mode> [dir-
 rc=0
 for h in "${HOSTS[@]}"; do
   [[ -n "${PLAN[$h]}" && "${PLAN[$h]}" != unreachable ]] || continue
-  addr="$(addr_of "$h")"
+  addr="$(addr_of "$h")"; CURRENT_HOST="$h"
   printf '\n=== %s ===\n' "$h"
   ok=1
   # Ordered, and each step gated on the one before it. The three pushes used to
@@ -348,6 +363,6 @@ for h in "${HOSTS[@]}"; do
   fi
 done
 
-for t in "${CRONTMP[@]}"; do rm -f "$t"; done
+CURRENT_HOST=""
 (( ${#unreachable[@]} )) && rc=1
 exit "$rc"
