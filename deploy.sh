@@ -20,6 +20,10 @@ set -euo pipefail
 #   ./deploy.sh --check         change nothing; report each host's --status
 #   ./deploy.sh --dry-run       plan and diff only
 #   ./deploy.sh --host srv01    just that host (repeatable)
+#   ./deploy.sh --yes           skip the confirmation prompt; required when
+#                               stdin is not a terminal (cron, CI)
+#   ./deploy.sh --force         push even where the checksums already match,
+#                               to undo a hand-edit made on a target
 # ============================================================================
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +31,9 @@ CONF="${DEPLOY_CONF:-$SRC_DIR/deploy.conf}"
 
 CHECK_ONLY=0; DRY_RUN=0; ASSUME_YES=0; FORCE=0
 declare -a ONLY_HOSTS=()
-usage() { sed -n '4,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# Prints the header block between the two banner lines, so adding a line to it
+# cannot silently fall outside a hardcoded range (--yes and --force did).
+usage() { sed -n '5,${/^# ==/q;s/^# \{0,1\}//;p;}' "${BASH_SOURCE[0]}"; }
 while (( $# )); do
   case "$1" in
     -c|--check)   CHECK_ONLY=1 ;;
