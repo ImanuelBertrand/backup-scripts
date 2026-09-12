@@ -327,6 +327,7 @@ source "$CONFIG_DIR/config"
 declare -p BACKUP_PATHS &>/dev/null || preflight_fail "BACKUP_PATHS is not set in $CONFIG_DIR/config"
 (( ${#BACKUP_PATHS[@]} )) || preflight_fail "BACKUP_PATHS is empty in $CONFIG_DIR/config"
 declare -p EXTRA_BACKUP_ARGS &>/dev/null || EXTRA_BACKUP_ARGS=()  # e.g. (--one-file-system)
+declare -p UNBACKED_MOUNTS   &>/dev/null || UNBACKED_MOUNTS=()    # mounts deliberately not backed up
 EXCLUDE_FILE="${EXCLUDE_FILE:-$CONFIG_DIR/excludes}"
 DUMP_DIR="${DUMP_DIR:-$CONFIG_DIR/db-dumps}"
 LOCK_WAIT="${LOCK_WAIT:-15m}"
@@ -622,6 +623,135 @@ _have_db_config() {
 }
 
 # ============================================================================
+#  SOURCE PREFLIGHT  --  the two ways this script can report a healthy backup
+#  that contains nothing.
+#
+#  1. A source path that exists but has nothing in it. A mountpoint whose
+#     filesystem failed to mount (an unlocked-at-boot LUKS volume, an NFS server
+#     that was down, a USB disk nobody plugged in) is an ordinary empty
+#     directory. restic snapshots it, exits 0, .last-success is written and the
+#     dead-man's switch gets a success ping. A path that does not exist at all is
+#     safe -- restic fails with exit 3 -- so it is only this case that is silent.
+#
+#  2. --one-file-system, which is what config.sample recommends for a (/) backup.
+#     It stops restic wandering into a USB disk, and it stops it just as quietly
+#     at /home, /var or /srv when those are separate logical volumes, which is
+#     the normal LVM and cloud-image layout. The snapshot then holds the root
+#     filesystem and nothing else, and says so nowhere.
+#
+#  Both are fatal rather than a warning: the whole point is that they currently
+#  look like success, and a run that backs up an empty directory is worse than
+#  one that does not run at all. A mount that genuinely should not be backed up
+#  is declared in UNBACKED_MOUNTS and stops being reported.
+# ============================================================================
+
+# Filesystem types that hold nothing worth a snapshot. squashfs is here for
+# snap/AppImage loop mounts: read-only images, re-fetchable, and the files they
+# are built from live under / and are backed up.
+PSEUDO_FSTYPES="proc sysfs devtmpfs devpts tmpfs ramfs cgroup cgroup2 securityfs
+debugfs tracefs pstore bpf configfs fusectl mqueue hugetlbfs autofs binfmt_misc
+efivarfs nsfs rpc_pipefs selinuxfs squashfs overlay fuse.gvfsd-fuse fuse.portal"
+
+is_mountpoint() {                      # path -> 0 if a filesystem is mounted there
+  local p="$1" d pd
+  d=$(stat -c %d "$p"    2>/dev/null) || return 1
+  pd=$(stat -c %d "$p/.." 2>/dev/null) || return 1
+  [[ "$d" != "$pd" ]] && return 0
+  [[ "$(readlink -f "$p")" == / ]]     # / is its own parent
+}
+
+one_file_system_in_use() {
+  local a
+  for a in ${EXTRA_BACKUP_ARGS+"${EXTRA_BACKUP_ARGS[@]}"}; do
+    [[ "$a" == "--one-file-system" || "$a" == "-x" ]] && return 0
+  done
+  return 1
+}
+
+# Anchored, literal exclude patterns, which is all this needs to recognise the
+# pseudo-filesystem entries. Wildcards and unanchored names are skipped: at
+# worst a deliberately excluded mount is reported as a gap, which is a loud and
+# one-line-of-config fixable answer, not a silent one.
+excluded_prefixes() {
+  [[ -r "$EXCLUDE_FILE" ]] || return 0
+  grep -E '^/[^*?[]*$' "$EXCLUDE_FILE" 2>/dev/null | sed 's:/\+$::' || true
+}
+
+check_backup_sources() {
+  local p
+  for p in "${BACKUP_PATHS[@]}"; do
+    [[ -e "$p" ]] || preflight_fail \
+"BACKUP_PATHS lists $p, which does not exist.
+Fix the path in $CONFIG_DIR/config, or create/mount it."
+    [[ -d "$p" ]] || continue
+    # A mounted-but-empty filesystem is a real (if odd) state; an empty
+    # directory that is NOT a mountpoint is what a failed mount looks like.
+    is_mountpoint "$p" && continue
+    [[ -n "$(find "$p" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] || preflight_fail \
+"BACKUP_PATHS lists $p, which exists but is empty and is not a mountpoint.
+This is what a filesystem that failed to mount looks like, and backing it up
+would record an empty directory as a successful backup. Mount it, or remove it
+from BACKUP_PATHS."
+  done
+}
+
+# Every local mount that --one-file-system will silently decline to cross.
+check_one_file_system_coverage() {
+  one_file_system_in_use || return 0
+  local -a gaps=() ex_prefixes=()
+  local target fstype p root best t_dev p_dev ex covered pseudo
+  mapfile -t ex_prefixes < <(excluded_prefixes)
+  pseudo=" ${PSEUDO_FSTYPES//[$'\n\t']/ } "          # whole-word matching, not substring
+
+  while read -r _ target fstype _; do
+    target="$(printf '%b' "$target")"
+    [[ "$pseudo" == *" $fstype "* ]] && continue
+
+    # Which backup root would have to reach this mount? Longest match wins.
+    best=""
+    for p in "${BACKUP_PATHS[@]}"; do
+      root="${p%/}"; root="${root:-/}"
+      [[ "$target" == "$root" || "$target" == "$root"/* || "$root" == / ]] || continue
+      (( ${#root} > ${#best} )) && best="$root"
+    done
+    [[ -n "$best" ]] || continue                       # outside the backup set entirely
+
+    covered=0
+    for p in "${BACKUP_PATHS[@]}"; do
+      [[ "${p%/}" == "${target%/}" ]] && { covered=1; break; }   # restic is given it directly
+    done
+    for ex in ${UNBACKED_MOUNTS+"${UNBACKED_MOUNTS[@]}"}; do
+      [[ "${ex%/}" == "${target%/}" ]] && { covered=1; break; }  # declared as not wanted
+    done
+    for ex in ${ex_prefixes+"${ex_prefixes[@]}"}; do
+      [[ -n "$ex" && ( "$target" == "$ex" || "$target" == "$ex"/* ) ]] && { covered=1; break; }
+    done
+    (( covered )) && continue
+
+    # A bind mount inside the same filesystem shares the device id, and
+    # --one-file-system compares device ids -- restic crosses it happily.
+    t_dev=$(stat -c %d "$target" 2>/dev/null) || continue
+    p_dev=$(stat -c %d "$best"   2>/dev/null) || continue
+    [[ "$t_dev" == "$p_dev" ]] && continue
+
+    gaps+=("$target ($fstype)")
+  done < /proc/self/mounts
+
+  (( ${#gaps[@]} )) || return 0
+  preflight_fail \
+"--one-file-system is in EXTRA_BACKUP_ARGS, and these mounted filesystems are
+inside the backup set but will be silently skipped:
+
+$(printf '  %s\n' "${gaps[@]}")
+
+Each one would be missing from every snapshot, with no error at restore time.
+Either add it to BACKUP_PATHS in $CONFIG_DIR/config, exclude it in
+$EXCLUDE_FILE, or -- if it really should not be backed up -- acknowledge it:
+
+  UNBACKED_MOUNTS=($(printf '%s ' "${gaps[@]%% *}" | sed 's/ $//'))"
+}
+
+# ============================================================================
 #  SCHEDULING GATE  --  "is this hour the moment?"
 #
 #  Two different ages, deliberately:
@@ -761,6 +891,12 @@ if [[ -z "$DUE_REASON" ]]; then
   stale_exit "not due yet"
 fi
 log "Due: $DUE_REASON"
+
+# Only on a run that is actually going to back up: a source that is missing or
+# unmounted is a reason to page, but not a reason to page on an hour we were
+# going to skip anyway.
+check_backup_sources
+check_one_file_system_coverage
 
 # ---- Network gate ----
 # Only knob left: skip metered links (cellular cost). Reachability of 10.0.0.2

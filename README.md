@@ -213,8 +213,26 @@ export RESTIC_REST_PASSWORD="…"              # the htpasswd password
 export RESTIC_PASSWORD_FILE="/root/.config/restic/encryption-pw"
 
 BACKUP_PATHS=(/)
-EXTRA_BACKUP_ARGS=(--one-file-system)        # strongly advised with (/)
+EXTRA_BACKUP_ARGS=(--one-file-system)        # see the caveat below
+UNBACKED_MOUNTS=()                           # mounts you chose not to back up
 ```
+
+> **`--one-file-system` does not warn you about what it skips.** It is the right
+> flag for keeping restic out of a USB disk, and it stops just as quietly at
+> `/home`, `/var` or `/srv` when those are separate logical volumes — the normal
+> LVM and cloud-image layout. The snapshot then contains the root filesystem and
+> nothing else, exits `0`, and looks like every healthy backup until a restore.
+>
+> The script therefore refuses to run with the flag set while any mounted
+> filesystem inside `BACKUP_PATHS` would be skipped. It names each one, and the
+> fix is to add it to `BACKUP_PATHS`, exclude it, or list it in
+> `UNBACKED_MOUNTS` to say the omission is deliberate. Pseudo-filesystems and
+> bind mounts within the same filesystem are not reported — restic crosses the
+> latter regardless, because `--one-file-system` compares device ids.
+>
+> A source path that exists but is **empty and not a mountpoint** is refused for
+> the same reason: that is exactly what a filesystem that failed to mount looks
+> like, and it would otherwise be snapshotted as a successful, empty backup.
 
 Then set the per-host behaviour:
 

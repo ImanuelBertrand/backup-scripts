@@ -33,10 +33,22 @@ export RESTIC_PASSWORD_FILE="$HOME/.config/restic/encryption-pw"
 # Required, must be non-empty. Whole-system backup = (/).
 BACKUP_PATHS=(/)
 
-# Extra args for `restic backup`. --one-file-system is strongly advised with a
-# (/) backup so restic does not wander into other mounts (USB, network shares,
-# bind mounts) that the exclude file might not cover.
+# Extra args for `restic backup`. --one-file-system keeps restic from wandering
+# into other mounts (USB disks, network shares) that the exclude file might not
+# cover -- but it is a blunt instrument, and it stops just as quietly at /home,
+# /var or /srv when those are separate logical volumes, which is the normal LVM
+# and cloud-image layout. A snapshot then holds the root filesystem and nothing
+# else, and nothing says so until a restore.
+#
+# So the script refuses to run with this flag while a mounted filesystem inside
+# BACKUP_PATHS would be skipped. It names each one and its answer is one of:
+# add it to BACKUP_PATHS, exclude it, or declare it below.
 EXTRA_BACKUP_ARGS=(--one-file-system)
+
+# Mounts that are deliberately NOT backed up -- scratch space, a media library
+# with its own copy, a share that belongs to another host. Listing one here is
+# what turns "this would be silently skipped" into a decision you made.
+UNBACKED_MOUNTS=()    # e.g. (/mnt/scratch /srv/media)
 
 # Exclude file (defaults to $CONFIG_DIR/excludes if unset). `excludes` has no
 # secrets and IS committed to the repo.
