@@ -63,6 +63,12 @@
 # ---- General caches & trash ----
 .cache
 .local/share/Trash
+# Flatpak points each app's XDG_CACHE_HOME at ~/.var/app/<id>/cache, which the
+# .cache line above does NOT catch: the directory is named "cache", without the
+# dot. Miss it and a Flatpak browser or mail client writes its entire on-disk
+# cache into every snapshot -- tens of gigabytes that rewrite themselves
+# constantly, so it is churn in each run rather than bulk paid for once.
+.var/app/*/cache
 
 # ---- Package-manager caches (re-downloaded on demand) ----
 # apt's index lists matter beyond their size: "apt update" rewrites them whole,
