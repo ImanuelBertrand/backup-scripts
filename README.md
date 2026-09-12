@@ -704,7 +704,7 @@ which is usually what you actually want.
 | `--private-repos` + per-client htpasswd | Clients on the same WG subnet reading or deleting each other's backups. |
 | Per-client encryption password | The backup host's storage being read or stolen. |
 | `:ro` auth mount, `no-new-privileges` | A compromised rest-server container rewriting credentials or escalating. |
-| `$DUMP_DIR` wiped on exit, mode `0700` | Plaintext database dumps lingering on client disks. |
+| `$DUMP_DIR` wiped on exit and on SIGTERM/INT/HUP, mode `0700` | Plaintext database dumps lingering on client disks. |
 | Secrets via env / container env / `curl -K`, never argv | Passwords appearing in the host process list. |
 | `config` and `pre-backup` refused unless root-owned and not group/world-writable | A writable config turning the hourly root cron job into unattended root code execution. |
 | No self-update path; clients never fetch code | One compromised GitHub credential becoming root on every host within the hour. |

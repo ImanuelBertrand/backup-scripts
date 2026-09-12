@@ -1034,7 +1034,10 @@ ping_dms "$PING_URL/start"
 #  directory, so the hook must never clear $DUMP_DIR itself -- see ./pre-backup.
 # ============================================================================
 PRE_BACKUP_HOOK="${PRE_BACKUP_HOOK:-$CONFIG_DIR/pre-backup}"   # optional generic hook
-cleanup_dumps() { rm -rf "${DUMP_DIR:?}"/* 2>/dev/null || true; }
+# find, not `rm -rf "$DUMP_DIR"/*`: a glob does not match leading dots, so a
+# hook that wrote $DUMP_DIR/.env or a tool that left a dot-prefixed temp file
+# left plaintext behind after a run that promised to wipe it.
+cleanup_dumps() { find "${DUMP_DIR:?}" -mindepth 1 -delete 2>/dev/null || true; }
 if _have_db_config || [[ -x "$PRE_BACKUP_HOOK" ]]; then
   # A symlinked $DUMP_DIR would send every plaintext dump through it and have
   # the chmod land on the target, so refuse one outright; -m 700 keeps the
@@ -1042,7 +1045,16 @@ if _have_db_config || [[ -x "$PRE_BACKUP_HOOK" ]]; then
   # and chmod (the chmod stays, for a directory that already exists).
   [[ ! -L "$DUMP_DIR" ]] || { echo "FATAL: \$DUMP_DIR ($DUMP_DIR) is a symlink" >&2; exit 1; }
   mkdir -p -m 700 "$DUMP_DIR"; chmod 700 "$DUMP_DIR"
+  # EXIT alone is not enough: a non-interactive bash killed by an untrapped
+  # SIGTERM -- a reboot, `systemctl stop`, the OOM killer -- dies without running
+  # it, and a full pg_dumpall then sits in $DUMP_DIR in plaintext until the next
+  # DUE run, which may be FORCE_AFTER_HOURS away and never comes at all if the
+  # config broke in the meantime. Not a failure to page about; the staleness
+  # alarm covers the missed backup.
   trap 'cleanup_dumps' EXIT
+  trap 'log "Interrupted (SIGTERM); wiping $DUMP_DIR."; cleanup_dumps; exit 143' TERM
+  trap 'log "Interrupted (SIGINT); wiping $DUMP_DIR.";  cleanup_dumps; exit 130' INT
+  trap 'log "Interrupted (SIGHUP); wiping $DUMP_DIR.";  cleanup_dumps; exit 129' HUP
   cleanup_dumps                       # clear any junk a crashed run left
   __um=$(umask); umask 077            # dumps are 0600
   run_db_dumps
@@ -1052,8 +1064,10 @@ if _have_db_config || [[ -x "$PRE_BACKUP_HOOK" ]]; then
     export DUMP_DIR; run_step "pre-backup-hook" "$PRE_BACKUP_HOOK"
   }
   # Any artifact counts, not just *.sql -- the hook is generic and may write
-  # anything. (A failing compgen here is exempt from set -e: it precedes the &&.)
-  compgen -G "$DUMP_DIR/*" >/dev/null && BACKUP_PATHS+=("$DUMP_DIR")
+  # anything, dot-prefixed included, which is why this is find and not a glob.
+  # (A failing test here is exempt from set -e: it precedes the &&.)
+  [[ -n "$(find "$DUMP_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]] \
+    && BACKUP_PATHS+=("$DUMP_DIR")
 fi
 
 # ---- Self-heal stale locks in this client's subrepo (stale-only; safe) ----
