@@ -161,11 +161,11 @@ Four guards worth knowing about:
   simply offline; `wg-quick up` could not resolve the endpoint anyway, and a
   failed `up` after a successful `down` leaves you worse off than before.
 - **At most one bounce per `WG_BOUNCE_INTERVAL_HOURS`** (default `6`, `0` to
-  disable the limit). Cron calls the script hourly and past `FORCE_AFTER_HOURS`
-  every one of those runs is due, so a backend that is genuinely down for two
-  days would otherwise be met with 48 restarts. The *first* bounce of an outage
-  is still immediate — only the retries are spaced — and a successful backup
-  resets the interval.
+  disable the limit). Cron calls the script hourly and while today's backup has
+  not succeeded every one of those runs is due, so a backend genuinely down for
+  two days would otherwise be met with 48 restarts. The *first* bounce of an
+  outage is still immediate — only the retries are spaced — and a successful
+  backup resets the interval.
 - If something else owns the tunnel (NetworkManager, a bespoke unit), set
   `WG_RESTART_CMD` and it runs in place of the `systemctl` / `wg-quick` logic
   above. It does **not** opt out of the other two guards: the default-route
@@ -275,7 +275,6 @@ Then set the per-host behaviour:
 |---|---|---|
 | `SKIP_IF_METERED` | `"false"` | `"true"` |
 | `MAX_BACKUP_AGE_HOURS` | `"36"` — one missed night is fine, two is not | `"168"` — a week away from the tunnel is normal |
-| `BACKUP_WINDOW` | `"23-06"` | `"23-06"` (rarely satisfied — see note) |
 | `WG_INTERFACE` | `"wg0"` if the tunnel is local to this host | `"wg0"` |
 | `WG_BOUNCE_INTERVAL_HOURS` | `"6"` (default) | `"6"` (default) |
 | `EXTRA_BACKUP_ARGS` | `(--one-file-system)` | `(--one-file-system)` |
@@ -287,10 +286,12 @@ Then set the per-host behaviour:
 > has a server saying something every single run. A config still setting
 > `SKIP_IF_UNREACHABLE` gets a warning, and the variable is ignored.
 
-> **Laptop note.** A laptop asleep from 23:00 to 06:00 never satisfies
-> `BACKUP_WINDOW`, so every one of its backups comes from the
-> `FORCE_AFTER_HOURS` catch-up, at whatever daytime hour it happens to be awake.
-> That is intended. What the laptop gains from the hourly schedule is *retries* —
+> **Laptop note.** A laptop asleep at midnight misses the night run, so its
+> backup happens in the first hour it is awake with the tunnel up — at whatever
+> daytime hour that turns out to be. That is intended, and it does not cost it
+> the night slot: being due is decided against midnight, not against the last
+> success, so an afternoon backup today still leaves tomorrow's 00:xx
+> invocation due. What the laptop gains from the hourly schedule is *retries* —
 > 24 chances a day to catch a moment when the tunnel is up, instead of one.
 
 Finally, notifications (all optional — leave empty to disable):
@@ -323,9 +324,9 @@ Expect `created restic repository … at rest:http://10.0.0.2:8000/srv01/`. A
 RESTIC_CONFIG_DIR=/root/.config/restic /usr/local/sbin/restic-backup.sh --force
 ```
 
-`--force` bypasses the window and the min-interval gates, which a first run by
-hand will otherwise trip (§4). Success is **silent by design** — no ntfy on
-success. You should see `Backup complete.` and a new snapshot:
+`--force` backs up even when today's backup has already succeeded, which is
+what a first run by hand otherwise trips over (§4). Success is **silent by
+design** — no ntfy on success. You should see `Backup complete.` and a new snapshot:
 
 ```bash
 restic snapshots
@@ -335,11 +336,13 @@ restic snapshots
 
 ## 4. Scheduling
 
-**Cron calls the script every hour. The script decides whether to back up.**
+**Cron calls the script every hour. The script decides whether to back up** —
+it backs up when nothing has succeeded yet today, so the invocation after
+midnight is the night run and the rest of the day's are retries behind it.
 
-All the policy lives in the config (§3.3), not in the crontab: one line per host,
-identical everywhere, and you change behaviour by editing a file instead of a
-schedule. A run that isn't due exits in milliseconds.
+The crontab is therefore one line per host, identical everywhere except the
+minute, and there is no schedule to tune in the config either (§4.2). A run
+that isn't due exits in milliseconds.
 
 ### 4.1 Install the cron entry
 
@@ -370,27 +373,51 @@ Five details in there, each fixing something specific to cron:
 
 ### 4.2 What the script does with those 24 invocations
 
+One rule, with nothing to configure:
+
 ```
-BACKUP_WINDOW="23-06"        run in this local-hour window, ...
-MIN_INTERVAL_HOURS="20"      ... but not if a run succeeded this recently, ...
-FORCE_AFTER_HOURS="24"       ... and ignore the window entirely past this age.
-MAX_BACKUP_AGE_HOURS="36"    hard fail: alert once the last success is this old.
+back up when nothing has succeeded yet TODAY (local calendar day).
 ```
 
-On a server this produces one backup a night at ~23:00, with six more chances
-before 06:00 if the first attempt finds the tunnel down.
+So the first invocation after local midnight is the night run, and the other 23
+are retries that do something only while that night run has not succeeded —
+backend down, tunnel down, machine asleep. A daytime backup is always a
+*fallback*, never a schedule: the following midnight puts the host straight
+back on the night slot, whatever hour today's success finally landed on.
 
-`MIN_INTERVAL_HOURS` must stay **below 24**. At exactly 24, a run that lands at
-01:00 makes the next one eligible at 01:00, and that ratchet walks the backup
-later every day until it falls out of the window entirely.
+```
+00:23  due    -> backend unreachable, silent skip
+01:23  due    -> still unreachable
+...
+14:23  due    -> tunnel back; backup succeeds, .last-success = today
+15:23  not due
+...
+00:23  due    <- next day, night slot again. No drift.
+```
 
-> **`FORCE_AFTER_HOURS` is the only catch-up you have.** Plain cron does not
+**Why days and not hours.** Any rule of the form "not sooner than N hours after
+the last success" measures from a point that moves: one run that slips into the
+afternoon makes the next one eligible in the afternoon, and the backup walks
+around the clock with nothing to pull it back to the night. A midnight deadline
+does not move because a run was late. The same property is why daylight-saving
+transitions cost nothing here — the schedule does no hour arithmetic at all.
+
+The one oddity it accepts: a backup that succeeds at, say, 23:50 is followed by
+another at 00:23, half an hour later. That is an incremental run on a host that
+has just been backed up, and it is the mechanism pulling a drifted host back
+onto the night slot.
+
+`BACKUP_WINDOW`, `MIN_INTERVAL_HOURS` and `FORCE_AFTER_HOURS` are **obsolete**.
+A config still carrying one gets a warning, and the value is ignored.
+
+> **The hourly grid is the only catch-up you have.** Plain cron does not
 > replay jobs missed while a machine was off or asleep — no anacron, no systemd
 > `Persistent=`. That makes `/root/.config/restic/.last-success` load-bearing: it
 > is the sole record of when a backup last worked, it is written **only** after
 > `restic backup` returns 0, and nothing else touches it. Deleting it makes the
 > host back up on its next invocation (harmless); a stale copy restored from a
-> snapshot would make it skip (which is why `MAX_BACKUP_AGE_HOURS` exists).
+> snapshot would make it skip the rest of that day (which is why
+> `MAX_BACKUP_AGE_HOURS` exists).
 
 ### 4.3 A skip cannot hide
 
@@ -436,13 +463,13 @@ heal itself) but go through the same throttle, so it is one page, then
 
 ```console
 # restic-backup.sh --status
-last success : 2026-09-11 23:24:07 (6h29m ago)
-window       : 23-06  (now 05:53 -> inside)
-thresholds   : min-interval 20h, catch-up 24h, hard-fail 36h
+last success : 2026-09-12 00:24:07 (29h29m ago)
+schedule     : one success per local day  (today 2026-09-13, last success day 2026-09-12)
+thresholds   : hard-fail 36h, re-page 12h
 stale        : no
 mounts       : all mounts covered
 version      : matches published (checked 3h12m ago)
-decision     : not due, would skip
+decision     : nothing backed up yet today; last success 2026-09-12 (29h29m ago)
 ```
 
 It sends no notification and consumes none of the alerting state — the one
@@ -492,8 +519,9 @@ of silent skips into an alert, and it has no useful default for a host whose
 schedule you have just changed.
 
 > **Leaving `/etc/cron.daily` costs you anacron's catch-up**, which on most
-> distributions is what backs a machine up after every boot. `FORCE_AFTER_HOURS`
-> replaces it — which is why it is worth running the new script on the old
+> distributions is what backs a machine up after every boot. The hourly retry
+> replaces it: a machine that boots at 10:00 having missed midnight is still
+> due, and backs up at 10:xx. It is worth running the new script on the old
 > schedule for a few days first, and checking `--status` reports a sane
 > `last success`, before you pull the anacron entry.
 
@@ -615,9 +643,10 @@ Four things to be deliberate about:
   `source`d, so anything able to write it owns this host and every repo it
   reaches.
 - **Prune takes the repo lock.** Clients wait `LOCK_WAIT` (default 15m) via
-  `--retry-lock`, so schedule maintenance well away from the client window —
-  with the default `BACKUP_WINDOW="23-06"`, and catch-up runs possible at any
-  hour, late morning is the safe slot.
+  `--retry-lock`, so schedule maintenance well away from the clients. They all
+  aim at the hour after midnight, and a client whose night run failed retries
+  every hour until it lands, so pick a slot the healthy fleet has long left:
+  late morning is the safe one.
 - **`restic check` doesn't read the data** by default. Set
   `CHECK_READ_DATA_SUBSET` (e.g. `"5%"`) and the script rotates a deterministic
   slice by day-of-year, covering the whole repo every 20 runs. restic's own `x%`
@@ -703,7 +732,7 @@ Then let a real run repair it, or delete `.last-success` to reset.
 | Timeout / `unreachable` | WireGuard down. `wg show`, then `curl -i http://10.0.0.2:8000/`. |
 | `repository is already locked` | Concurrent maintenance prune. Clients retry for `LOCK_WAIT`; raise it or move the maintenance window. |
 | `Another run has held the lock for …; exiting.` | A previous run is still going (`flock`). Not an error while that time is under `MAX_BACKUP_AGE_HOURS`; past it the holder is treated as wedged and alerts. |
-| `Not due …; exiting.` | Normal, 23 times a day. `--status` shows why. |
+| `Not due (already backed up today …)` | Normal, for every invocation after the one that succeeded. `--status` shows the same decision. |
 | Backup skipped, no alert | Metered link, tunnel down, or not due — and the last success is still within `MAX_BACKUP_AGE_HOURS`. By design; no ping is sent. |
 | `STALE: no successful backup for …` | The hard fail. The host is alive but hasn't backed up in `MAX_BACKUP_AGE_HOURS`; the log line above it says which skip path it took. |
 | `notification suppressed (already alerted…)` | Throttling (§4.3), not a new problem. The original push already went out. |

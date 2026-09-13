@@ -7,13 +7,17 @@
 #   systemctl reload crond   &&   journalctl -u crond | tail
 #
 # HOURLY on purpose. The script itself decides whether this hour is the moment
-# (BACKUP_WINDOW / MIN_INTERVAL_HOURS / FORCE_AFTER_HOURS in the config) and
-# exits in milliseconds when it is not. Cron does NOT replay jobs missed while
-# the machine was off or asleep, so FORCE_AFTER_HOURS is the only catch-up a
-# laptop gets -- do not disable it.
+# -- it backs up when nothing has succeeded yet today, and exits in
+# milliseconds when something has. So the 00:xx invocation is the night run and
+# the other 23 are retries that only do anything while the night run has not
+# landed. Do not "tidy" this into a single nightly entry: cron does NOT replay
+# jobs missed while the machine was off or asleep, and the hourly grid IS the
+# catch-up a laptop gets.
 #
 # GIVE EVERY HOST A DIFFERENT MINUTE. It staggers clients off the repo lock, and
 # unlike a random delay you can see the spread at a glance across your fleet.
+# Keep it well short of :59 -- the minute you pick is also how far into the new
+# day the night run starts.
 
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin

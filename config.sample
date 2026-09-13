@@ -100,25 +100,19 @@ SQLITE_FILES=()       # (name:/path/to.db ...)          -- host path, incl. bind
 # PRE_BACKUP_HOOK="$HOME/.config/restic/pre-backup"
 # DUMP_DIR="$HOME/.config/restic/db-dumps"
 
-# ---- Scheduling (the script gates itself; cron just calls it hourly) --------
-# Cron runs this every hour and the script decides whether this hour is the
-# moment. Reading order: run inside BACKUP_WINDOW, but not if a run already
-# succeeded within MIN_INTERVAL_HOURS, and ignore the window entirely once the
-# last success is FORCE_AFTER_HOURS old.
+# ---- Scheduling -- NOTHING TO SET -------------------------------------------
+# Cron runs this every hour and the script backs up when nothing has succeeded
+# yet TODAY (local calendar day). The 00:xx invocation is therefore the night
+# run; the other 23 are retries that fire only while the night run has not
+# succeeded (backend down, tunnel down, laptop asleep). A daytime backup is
+# always a fallback, and the next midnight puts the host back on the night slot.
 #
-# Local hours, "start-end", end exclusive; wraps midnight. "" = no window.
-BACKUP_WINDOW="23-06"
-
-# Don't repeat a successful backup sooner than this. Keep it BELOW 24 -- at 24
-# a run that lands at 01:00 makes the next one eligible at 01:00, and that
-# ratchet walks the backup later every day until it falls out of the window.
-MIN_INTERVAL_HOURS="20"
-
-# Catch-up. Plain cron does NOT replay jobs missed while the machine was off or
-# asleep, so on a laptop this is the ONLY thing that ever triggers a backup --
-# the 23-06 window is never satisfied by a machine that sleeps at night. It then
-# runs at whatever daytime hour the laptop happens to be awake. Don't set it to 0.
-FORCE_AFTER_HOURS="24"
+# There is no window, no minimum interval and no catch-up threshold to tune --
+# a rule of the form "not sooner than N hours after the last success" measures
+# from a moving point, so one late run drags every following one later and the
+# backup walks away from the night with nothing to pull it back. A midnight
+# deadline does not move. BACKUP_WINDOW, MIN_INTERVAL_HOURS and
+# FORCE_AFTER_HOURS are ignored; the script warns if it finds one here.
 
 # ---- Staleness = the hard fail ----------------------------------------------
 # Skipping is always silent; what turns silence into an alert is age. Every
@@ -133,8 +127,11 @@ FORCE_AFTER_HOURS="24"
 #   laptop that travels: 168 (a week away from the tunnel is normal)
 #   0                : never hard-fail on age (you then have ONLY the DMS)
 #
-# Must be greater than FORCE_AFTER_HOURS, or you get paged about backups that
-# were not due yet. The script warns at startup if it isn't.
+# Leave room for the schedule: successes are ~24h apart on a healthy host, and
+# a night the backend was down pushes the next one further -- a 00:xx run that
+# only lands at noon is a ~36h gap with nothing wrong at either end. Below 24
+# it pages about the schedule working as designed, and the script says so at
+# startup.
 MAX_BACKUP_AGE_HOURS="36"
 
 # While stale, re-page at most this often. 24 invocations a day must not mean
@@ -180,10 +177,10 @@ WG_INTERFACE=""                                    # e.g. "wg0"
 # WG_SETTLE_SECS="5"
 
 # Don't bounce again within this many hours. Cron calls the script hourly and
-# past FORCE_AFTER_HOURS every one of those runs is due, so without this a
-# backend that is genuinely down for two days would be met with 48 tunnel
-# restarts. The FIRST bounce of an outage is always immediate -- this only
-# spaces the retries -- and a successful backup resets it.
+# while today's backup has not succeeded every one of those runs is due, so
+# without this a backend genuinely down for two days would be met with 48
+# tunnel restarts. The FIRST bounce of an outage is always immediate -- this
+# only spaces the retries -- and a successful backup resets it.
 #   0 = no limit (bounce on every due run)
 # WG_BOUNCE_INTERVAL_HOURS="6"
 

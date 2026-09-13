@@ -23,17 +23,30 @@ set -euo pipefail
 #
 # ---------------------------------------------------------------------------
 # SELF-SCHEDULING. Cron invokes this HOURLY; the script decides whether this
-# particular hour is the moment to run. Three numbers do it (all in the config):
+# particular hour is the moment to run. ONE rule does it, and it has no knobs:
 #
-#   BACKUP_WINDOW=23-06       run in this local-hour window, ...
-#   MIN_INTERVAL_HOURS=20     ... but not if a run succeeded this recently, ...
-#   FORCE_AFTER_HOURS=24      ... and ignore the window entirely past this age.
+#   back up when nothing has succeeded yet TODAY (local calendar day).
+#
+# The first invocation after local midnight is therefore the one that backs up
+# -- the night run -- and every later hour of the same day is a RETRY that only
+# fires while that night run has not succeeded: backend down, tunnel down,
+# machine asleep. A daytime backup is always a fallback, never a schedule, and
+# the next midnight puts the host back on the night slot regardless of which
+# hour today's success finally landed on.
+#
+# It compares DAYS on purpose, not an elapsed-hours interval. Any "not sooner
+# than N hours" rule measures from the last success, so one run that slips into
+# the afternoon drags the next one to the afternoon as well and the backup
+# walks around the clock, away from the night, with nothing to pull it back.
+# Comparing calendar days has no such feedback: the deadline is midnight, which
+# does not move because a run was late. It is also why DST costs nothing here
+# -- no hour arithmetic is done on the schedule at all.
 #
 # Plain cron does NOT replay jobs missed while a machine was off or asleep (no
-# anacron, no systemd Persistent=). FORCE_AFTER_HOURS *is* the catch-up: a
-# laptop that is never awake during the window still backs up once a day, at
-# whatever hour it happens to be running. That makes $CONFIG_DIR/.last-success
-# load-bearing -- it is the only record of when a backup last worked.
+# anacron, no systemd Persistent=). The hourly retry IS the catch-up: a laptop
+# that is never awake at night backs up in its first awake hour, once a day.
+# That makes $CONFIG_DIR/.last-success load-bearing -- it is the only record of
+# when a backup last worked, and the entire schedule is derived from it.
 #
 # MAX_BACKUP_AGE_HOURS=36 is the hard fail. Every path that declines to back up
 # (not due, metered, tunnel down) exits through stale_exit(), so a host that
@@ -42,7 +55,7 @@ set -euo pipefail
 # Losing the lock is the one skip judged on a different number -- how long the
 # HOLDER has held it, because .last-success describes a run that has already
 # finished, not the one still going (see the lock section). Same threshold.
-# A transient failure inside the window is logged and retried next hour;
+# A transient failure is logged and retried the next hour;
 # only the first failure after a success, and the crossing of MAX_BACKUP_AGE,
 # page you (see notify_failure) -- 24 invocations a day must not mean 24 pushes.
 #
@@ -69,8 +82,8 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # ---- Arguments ----
 # Read from RESTIC_BACKUP_FORCE, never from a bare FORCE. This runs from cron
 # on every host, and FORCE is a common enough name that a wrapper, a CI job or
-# an exporting parent shell could switch off the window, the min-interval and
-# the metered gate on every hourly run without anyone meaning to -- and the
+# an exporting parent shell could switch off the once-a-day gate and the
+# metered gate on every hourly run without anyone meaning to -- and the
 # only trace would be a log line reading "forced (--force)" for a run where no
 # flag was passed.
 FORCE="${RESTIC_BACKUP_FORCE:-0}"
@@ -82,8 +95,9 @@ usage() {
   cat <<'USAGE'
 Usage: restic-backup.sh [--force] [--status] [--check-update]
 
-  --force         back up now, ignoring the window / min-interval / metered
-                  gates (reachability still applies -- nowhere to push to)
+  --force         back up now even though today's backup already succeeded,
+                  and ignoring the metered gate (reachability still applies --
+                  there would be nowhere to push to)
   --status        print the scheduling decision and exit; alerts nobody.
                   Exit 0 healthy, 3 past MAX_BACKUP_AGE_HOURS, 1 cannot tell
   --check-update  compare this file against the published version and report.
@@ -468,10 +482,9 @@ fi
 LOCK_WAIT="${LOCK_WAIT:-15m}"
 SKIP_IF_METERED="${SKIP_IF_METERED:-false}"
 
-# Scheduling / staleness. Hours; 0 disables that particular rule.
-BACKUP_WINDOW="${BACKUP_WINDOW-23-06}"               # unset = 23-06, "" = no window
-int_cfg MIN_INTERVAL_HOURS   20
-int_cfg FORCE_AFTER_HOURS    24
+# Staleness. Hours; 0 disables that particular rule. WHEN a run is due is not
+# configurable -- it is one success per local day, see SELF-SCHEDULING at the
+# top of this file. These two only decide when a run of skips starts paging.
 int_cfg MAX_BACKUP_AGE_HOURS 36                      # 0 = never hard-fail on age
 int_cfg NOTIFY_REPEAT_HOURS  12                      # re-page interval while stale
 
@@ -488,24 +501,36 @@ WG_RESTART_CMD="${WG_RESTART_CMD:-}"                 # overrides the built-in lo
 int_cfg WG_SETTLE_SECS 5                             # seconds, not hours
 int_cfg WG_BOUNCE_INTERVAL_HOURS 6                   # 0 = bounce on every due run
 
+# The three scheduling knobs are accepted-and-ignored rather than fatal: they
+# sit in every config deployed so far, and a host must not stop backing up
+# because its config still carries one.
+for __obsolete in BACKUP_WINDOW MIN_INTERVAL_HOURS FORCE_AFTER_HOURS; do
+  declare -p "$__obsolete" &>/dev/null || continue
+  log "WARN: $__obsolete is obsolete and ignored -- the schedule is one successful"
+  log "WARN: backup per local calendar day, retried hourly until it lands, and takes"
+  log "WARN: no configuration. Delete it from $CONFIG_DIR/config."
+done
+unset __obsolete
+
 if declare -p SKIP_IF_UNREACHABLE &>/dev/null; then
   log "WARN: SKIP_IF_UNREACHABLE is obsolete and ignored -- an unreachable backend is"
   log "WARN: now always a silent skip, and MAX_BACKUP_AGE_HOURS decides when that"
   log "WARN: becomes a failure. Delete it from $CONFIG_DIR/config."
 fi
 
-MIN_INTERVAL_SEC=$(( MIN_INTERVAL_HOURS * 3600 ))
-FORCE_AFTER_SEC=$(( FORCE_AFTER_HOURS * 3600 ))
 MAX_AGE_SEC=$(( MAX_BACKUP_AGE_HOURS * 3600 ))
 NOTIFY_REPEAT_SEC=$(( NOTIFY_REPEAT_HOURS * 3600 ))
 VERSION_CHECK_INTERVAL_SEC=$(( VERSION_CHECK_INTERVAL_HOURS * 3600 ))
 WG_BOUNCE_INTERVAL_SEC=$(( WG_BOUNCE_INTERVAL_HOURS * 3600 ))
 
-# The hard-fail threshold must sit ABOVE the catch-up threshold, or the script
-# pages you about a backup it was never going to attempt yet.
-if (( MAX_AGE_SEC > 0 && FORCE_AFTER_SEC > 0 && MAX_AGE_SEC <= FORCE_AFTER_SEC )); then
-  log "WARN: MAX_BACKUP_AGE_HOURS ($MAX_BACKUP_AGE_HOURS) <= FORCE_AFTER_HOURS ($FORCE_AFTER_HOURS);"
-  log "WARN: expect alerts for backups that are not yet due. Raise MAX_BACKUP_AGE_HOURS."
+# The hard-fail threshold has to leave room for the schedule itself. Successive
+# successes are ~24h apart on a healthy host, and a night the backend was down
+# pushes the next one further: a failed 00:xx run that only lands at noon makes
+# a ~36h gap with nothing wrong at either end. Anything at or below 24h pages
+# about the schedule working as designed.
+if (( MAX_AGE_SEC > 0 && MAX_BACKUP_AGE_HOURS <= 24 )); then
+  log "WARN: MAX_BACKUP_AGE_HOURS ($MAX_BACKUP_AGE_HOURS) leaves no room for a once-a-day"
+  log "WARN: schedule; expect alerts for backups that are not yet due. Use 30 or more."
 fi
 
 # The config is authoritative from here on: it has just overwritten whatever the
@@ -945,8 +970,8 @@ from BACKUP_PATHS."
 mount_gap_status() {
   local last=0 seen="" n when=""
   one_file_system_in_use || { printf -- '--one-file-system not in use'; return; }
-  # No state file at all means no due run has scanned yet -- a fresh deploy,
-  # whose first run FORCE_AFTER_HOURS may put a day out. Distinct from a run
+  # No state file at all means no due run has scanned yet -- a fresh deploy
+  # whose first run the backend may still be refusing. Distinct from a run
   # that looked and found nothing, which records an empty set below.
   [[ -s "$MOUNT_GAP_FILE" ]] || { printf 'not yet checked (no due run since deploy)'; return; }
   read -r last seen < "$MOUNT_GAP_FILE" || true
@@ -1036,9 +1061,9 @@ check_one_file_system_coverage() {
     # Records the CLEAN SCAN rather than removing the file. "No file" and
     # "looked, found nothing" are different claims, and with the file gone
     # --status cannot tell them apart: it reads a freshly deployed host as
-    # "all mounts covered" before any due run has scanned it, which
-    # FORCE_AFTER_HOURS can put a day away. Reporting healthy without having
-    # looked is the one claim this must never make.
+    # "all mounts covered" before any due run has scanned it, and a backend
+    # that is down holds that off for as long as it stays down. Reporting
+    # healthy without having looked is the one claim this must never make.
     #
     # An empty set still makes a recurrence page at once -- deleting the file
     # would give that too, and this keeps it: mount_gap_should_push compares
@@ -1096,10 +1121,14 @@ $body"
 # ============================================================================
 #  SCHEDULING GATE  --  "is this hour the moment?"
 #
+#  The decision is TODAY vs the day of the last success. The ages below are
+#  what the log lines and the staleness alarm are phrased in; neither of them
+#  decides anything about the schedule.
+#
 #  Two different ages, deliberately:
-#    SCHED_AGE_SEC  time since the last SUCCESS; -1 ("never") means always due,
-#                   so a fresh install backs up immediately instead of waiting
-#                   for tonight's window.
+#    SCHED_AGE_SEC  time since the last SUCCESS; -1 means there has never been
+#                   one, and a fresh install backs up on its first invocation
+#                   rather than waiting for the coming midnight.
 #    ALERT_AGE_SEC  the same, but measured from .first-seen when there has never
 #                   been a success -- otherwise a host installed this morning
 #                   would page you as "36h stale" on day one.
@@ -1124,7 +1153,19 @@ FIRST_SEEN=$(read_epoch "$FIRST_SEEN_FILE")
 # the exit-3 gate exists to catch -- and, without this write, cannot see.
 if [[ ! -s "$FIRST_SEEN_FILE" ]]; then write_state "$FIRST_SEEN_FILE" "$FIRST_SEEN"; fi
 
+# The schedule, in two strings. Both days come from $NOW rather than from a
+# second call to date(1), so a run that starts a microsecond before midnight
+# cannot compare one day against the other's.
+#
+# A clock pushed forward and corrected leaves .last-success dated tomorrow:
+# that reads as "a different day", so the host is due, backs up, and stamps
+# today over it -- the self-repair an interval in hours needs an explicit rule
+# for is just the ordinary path here.
+TODAY="$(date -d "@$NOW" '+%Y-%m-%d')"
+LAST_SUCCESS_DAY=""
+
 if (( LAST_SUCCESS > 0 )); then
+  LAST_SUCCESS_DAY="$(date -d "@$LAST_SUCCESS" '+%Y-%m-%d')"
   SCHED_AGE_SEC=$(( NOW - LAST_SUCCESS ))
   if (( SCHED_AGE_SEC < 0 )); then
     log "WARN: .last-success lies in the future (clock skew?); treating as just-run."
@@ -1136,25 +1177,6 @@ else
   ALERT_AGE_SEC=$(( NOW - FIRST_SEEN ))
   if (( ALERT_AGE_SEC < 0 )); then ALERT_AGE_SEC=0; fi
 fi
-
-# NOTE: called inside a command substitution by --status, so every diagnostic
-# in here goes to stderr -- on stdout it would be captured as part of the value.
-in_backup_window() {
-  [[ -n "$BACKUP_WINDOW" ]] || return 0
-  if [[ ! "$BACKUP_WINDOW" =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]]; then
-    log "WARN: BACKUP_WINDOW='$BACKUP_WINDOW' is malformed; ignoring the window." >&2
-    return 0
-  fi
-  local s e h
-  s=$(( 10#${BASH_REMATCH[1]} )); e=$(( 10#${BASH_REMATCH[2]} ))
-  if (( s > 23 || e > 23 )); then
-    log "WARN: BACKUP_WINDOW='$BACKUP_WINDOW' is out of range; ignoring the window." >&2
-    return 0
-  fi
-  (( s == e )) && return 0                       # 0-0 etc. = always
-  h=$(( 10#$(date '+%H') ))
-  if (( s < e )); then (( h >= s && h < e )); else (( h >= s || h < e )); fi   # wraps midnight
-}
 
 # Every exit path that did NOT back up comes through here -- except losing the
 # flock, which is measured against the holder's age instead (see the lock
@@ -1184,15 +1206,18 @@ This run did not back up: $reason" "$age"
   exit 0
 }
 
+# Due until it works, then done for the day: the day stamp only moves when a
+# backup actually SUCCEEDS (.last-success is written at the end of a good run,
+# nowhere else), so a failed 00:xx attempt leaves this true and the 01:xx cron
+# invocation finds the same answer. That is the whole hourly retry -- there is
+# no retry counter and no backoff, because the hour grid already is one.
 DUE_REASON=""
 if (( FORCE )); then
   DUE_REASON="forced ($FORCE_SOURCE)"
-elif (( SCHED_AGE_SEC < 0 )); then
+elif [[ -z "$LAST_SUCCESS_DAY" ]]; then
   DUE_REASON="no successful backup on record"
-elif (( FORCE_AFTER_SEC > 0 && SCHED_AGE_SEC >= FORCE_AFTER_SEC )); then
-  DUE_REASON="catch-up: last success $(fmt_age "$SCHED_AGE_SEC") ago (>= ${FORCE_AFTER_HOURS}h)"
-elif (( SCHED_AGE_SEC >= MIN_INTERVAL_SEC )) && in_backup_window; then
-  DUE_REASON="in window ${BACKUP_WINDOW:-any}, last success $(fmt_age "$SCHED_AGE_SEC") ago"
+elif [[ "$LAST_SUCCESS_DAY" != "$TODAY" ]]; then
+  DUE_REASON="nothing backed up yet today; last success $LAST_SUCCESS_DAY ($(fmt_age "$SCHED_AGE_SEC") ago)"
 fi
 
 if (( STATUS_ONLY )); then
@@ -1201,15 +1226,15 @@ if (( STATUS_ONLY )); then
   else
     printf 'last success : never (first seen %s, %s ago)\n' "$(date -d "@$FIRST_SEEN" '+%Y-%m-%d %H:%M:%S')" "$(fmt_age "$ALERT_AGE_SEC")"
   fi
-  printf 'window       : %s  (now %s -> %s)\n' "${BACKUP_WINDOW:-none}" "$(date '+%H:%M')" \
-    "$(in_backup_window && echo inside || echo outside)"
-  printf 'thresholds   : min-interval %sh, catch-up %sh, hard-fail %sh\n' \
-    "$MIN_INTERVAL_HOURS" "$FORCE_AFTER_HOURS" "$MAX_BACKUP_AGE_HOURS"
+  printf 'schedule     : one success per local day  (today %s, last success day %s)\n' \
+    "$TODAY" "${LAST_SUCCESS_DAY:-never}"
+  printf 'thresholds   : hard-fail %sh, re-page %sh\n' \
+    "$MAX_BACKUP_AGE_HOURS" "$NOTIFY_REPEAT_HOURS"
   printf 'stale        : %s\n' \
     "$( (( MAX_AGE_SEC > 0 && ALERT_AGE_SEC >= MAX_AGE_SEC )) && echo 'YES -- would alert' || echo no )"
   printf 'mounts       : %s\n' "$(mount_gap_status)"
   printf 'version      : %s\n' "$(version_status)"
-  printf 'decision     : %s\n' "${DUE_REASON:-not due, would skip}"
+  printf 'decision     : %s\n' "${DUE_REASON:-not due -- already backed up today}"
   # Exit 3, not 0, when this host is past MAX_BACKUP_AGE_HOURS. --status is the
   # only way to ask a host "are you healthy?" without touching anything, and
   # deploy.sh --check runs it fleet-wide from CI; a mode that answered "stale:
@@ -1230,9 +1255,9 @@ fi
 # The newcomer must NOT judge the holder by .last-success: the holder has not
 # written it yet, so after a week offline that file is a week old and
 # stale_exit() would page "Backup FAILED" about the catch-up run that is at
-# that moment working perfectly -- and long catch-up runs are exactly what
-# FORCE_AFTER_HOURS produces. Judge the HOLDER instead, by how long it has
-# held the lock: that is the only number here that says anything about its
+# that moment working perfectly -- and the first run after a week offline is
+# exactly such a run. Judge the HOLDER instead, by how long it has held the
+# lock: that is the only number here that says anything about its
 # health. Still running past MAX_BACKUP_AGE_HOURS is not a slow backup, it is
 # a wedged one, and that does deserve a page.
 lock_held_secs() {                     # seconds since the holder took the lock
@@ -1268,8 +1293,8 @@ else
 fi
 
 if [[ -z "$DUE_REASON" ]]; then
-  log "Not due (last success $(fmt_age "$SCHED_AGE_SEC") ago, window ${BACKUP_WINDOW:-any}); exiting."
-  stale_exit "not due yet"
+  log "Not due (already backed up today, $(fmt_age "$SCHED_AGE_SEC") ago); exiting."
+  stale_exit "already backed up today"
 fi
 log "Due: $DUE_REASON"
 
@@ -1319,9 +1344,9 @@ wg_bounce() {
     log "WG: no default route -- host is offline; leaving the tunnel alone."
     return 1
   fi
-  # "Bounce once" has to mean once per OUTAGE, not once per run. Past
-  # FORCE_AFTER_HOURS every hourly invocation is due, so an endpoint that is
-  # genuinely down for two days would otherwise be met with 48 restarts. The
+  # "Bounce once" has to mean once per OUTAGE, not once per run. While today's
+  # backup has not succeeded every hourly invocation is due, so an endpoint
+  # that is genuinely down for two days would otherwise meet 48 restarts. The
   # first bounce of an outage is still immediate -- only retries are spaced --
   # and a successful backup clears the record.
   local last since
@@ -1417,7 +1442,7 @@ if _have_db_config || [[ -x "$PRE_BACKUP_HOOK" ]]; then
   # EXIT alone is not enough: a non-interactive bash killed by an untrapped
   # SIGTERM -- a reboot, `systemctl stop`, the OOM killer -- dies without running
   # it, and a full pg_dumpall then sits in $DUMP_DIR in plaintext until the next
-  # DUE run, which may be FORCE_AFTER_HOURS away and never comes at all if the
+  # DUE run -- the coming midnight at the latest, and never at all if the
   # config broke in the meantime. Not a failure to page about; the staleness
   # alarm covers the missed backup.
   trap 'cleanup_dumps' EXIT
