@@ -57,6 +57,8 @@ FORGET_POLICY_DEFAULT=(--keep-daily 7 --keep-weekly 4 --keep-monthly 12 --keep-y
 # used pack file, so it is by far the most expensive step; each client carries
 # its own timestamp under $CONFIG_DIR/state/ and comes due independently.
 # Must be >= 1. `--prune` on the command line forces it for every client.
+# The script treats a client as due half a day early, so the cadence survives a
+# run that reaches it earlier in the day than the run that stamped it.
 # PRUNE_MIN_INTERVAL_DAYS="7"
 
 # ---- Verification -------------------------------------------------------------

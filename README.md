@@ -649,6 +649,15 @@ prune is the expensive step — repacking touches every partially-used pack file
 due independently, rather than every repo landing on the same night. `--prune`
 forces it for every client in one run.
 
+That comparison allows half a day of slack (`PRUNE_DUE_SLACK`). The interval is
+counted in seconds, but the run spending it is daily and reaches each client at
+a different moment every day, since the clients ahead of it take a different
+amount of time to check. Against a flat `N × 86400`, a client reached seconds
+earlier in the day than the run that stamped it reads as a day short and waits
+another full day — over a year that lands more than half the cycles on 8 days
+instead of 7. Due half a day early means every run of that day sees it, so the
+cadence holds at exactly N days unless a run slips past midnight.
+
 `check` runs *after* prune deliberately: prune is the one step that rewrites
 pack files, so verifying behind it catches a bad repack in the run that caused
 it. The restore smoke-test then pulls one small known file out of `latest` and

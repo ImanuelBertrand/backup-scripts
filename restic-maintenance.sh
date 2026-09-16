@@ -10,8 +10,9 @@ set -euo pipefail
 #
 # Order per client: unlock -> forget -> prune -> check -> restore-test.
 #                    check and restore-test run EVERY run; forget and prune
-#                    only when this client's last successful prune is >=
-#                    PRUNE_MIN_INTERVAL_DAYS old (or --prune).
+#                    only when this client's last successful prune is
+#                    PRUNE_MIN_INTERVAL_DAYS old, give or take the half-day of
+#                    slack at PRUNE_DUE_SLACK (or --prune).
 #
 #                    check runs AFTER prune deliberately: prune is the one step
 #                    that rewrites pack files, so verifying behind it is what
@@ -155,6 +156,19 @@ PRUNE_MIN_INTERVAL_DAYS="${PRUNE_MIN_INTERVAL_DAYS:-7}"   # prune when last prun
 [[ "$PRUNE_MIN_INTERVAL_DAYS" =~ ^[0-9]+$ ]] && (( PRUNE_MIN_INTERVAL_DAYS >= 1 )) || {
   echo "FATAL: PRUNE_MIN_INTERVAL_DAYS must be a whole number >= 1 (got '$PRUNE_MIN_INTERVAL_DAYS')" >&2; exit 1; }
 
+# The interval is counted in seconds, but the run that spends it is daily and
+# reaches each client at a different moment every day: the clients ahead of it
+# in CLIENTS take a different amount of time to check, and check dominates the
+# runtime. Comparing against a flat N*86400 therefore defers a client that is
+# reached a few SECONDS earlier in the day than the run that stamped it -- the
+# gap reads as N-1 days and it waits a whole extra day for a schedule that only
+# offers one decision per day. Half a day of slack absorbs the jitter: due
+# lands mid-night, every run of the day sees it, and the cadence holds at
+# exactly N days while the run's start time moves by less than 12h. Beyond
+# that (a NAS outage delaying a run past midnight) one cycle stretches to N+1
+# days and re-anchors, which is the safe direction for an expensive step.
+PRUNE_DUE_SLACK=43200
+
 NTFY_URL="${NTFY_URL:-}"
 NTFY_TOPIC_HIGH="${NTFY_TOPIC_HIGH:-backups-high}"
 NTFY_TOKEN="${NTFY_TOKEN:-}"
@@ -176,6 +190,11 @@ client_prune_offset_days() {
 
 # ---- Helpers (same conventions as the client script) ----
 log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*"; }
+# seconds -> "6d21h". Days alone cannot show the prune gate's real margin: a
+# client an hour short of due and one a day short both print "6d".
+# A stamp in the future (clock jump, hand-edited state) would otherwise print a
+# negative hour count; the gate itself just skips until real time catches up.
+fmt_age_dh() { local s="$1"; (( s < 0 )) && s=0; printf '%dd%02dh' $(( s / 86400 )) $(( (s % 86400) / 3600 )); }
 ping_dms() { [[ -n "$PING_URL" ]] || return 0; curl -fsS -m 10 --retry 3 "$1" >/dev/null 2>&1 || true; }
 
 # Atomic, and deliberately never fatal: a state write that fails must not turn
@@ -353,14 +372,15 @@ for client in "${CLIENTS[@]}"; do
     last_prune_epoch=$(( now_epoch - (PRUNE_MIN_INTERVAL_DAYS - offset_days) * 86400 ))
     write_state "$state_file" "$last_prune_epoch"
   fi
-  age_days=$(( (now_epoch - last_prune_epoch) / 86400 ))
+  age_seconds=$(( now_epoch - last_prune_epoch ))
+  due_epoch=$(( last_prune_epoch + PRUNE_MIN_INTERVAL_DAYS * 86400 - PRUNE_DUE_SLACK ))
 
-  if [[ "$FORCE_PRUNE" == "true" ]] || (( age_days >= PRUNE_MIN_INTERVAL_DAYS )); then
+  if [[ "$FORCE_PRUNE" == "true" ]] || (( now_epoch >= due_epoch )); then
     run_prune_this_client=true
-    log "[$client] forget/prune: due (last prune ${age_days}d ago, threshold ${PRUNE_MIN_INTERVAL_DAYS}d$([[ "$FORCE_PRUNE" == "true" ]] && echo ", --prune forced"))"
+    log "[$client] forget/prune: due (last prune $(fmt_age_dh "$age_seconds") ago, every ${PRUNE_MIN_INTERVAL_DAYS}d$([[ "$FORCE_PRUNE" == "true" ]] && echo ", --prune forced"))"
   else
     run_prune_this_client=false
-    log "[$client] forget/prune: skipped (last prune ${age_days}d ago, due at ${PRUNE_MIN_INTERVAL_DAYS}d)"
+    log "[$client] forget/prune: skipped (last prune $(fmt_age_dh "$age_seconds") ago, due $(date -d "@$due_epoch" '+%Y-%m-%dT%H:%M'))"
   fi
 
   if [[ "$run_prune_this_client" == "true" ]]; then
