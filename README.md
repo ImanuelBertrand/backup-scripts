@@ -440,13 +440,40 @@ Because 24 invocations a day must not mean 24 pushes, notification is throttled:
 
 | Event | Notification |
 |---|---|
+| Failure on a run the machine **slept through**, still under `MAX_BACKUP_AGE_HOURS` | log only — no ntfy, no `/fail` ping, `.notify-state` untouched |
 | First failure after a success | ntfy **urgent** — breakage is actionable now |
 | Further failures, still under `MAX_BACKUP_AGE_HOURS` | log + `/fail` ping only |
-| Crossing `MAX_BACKUP_AGE_HOURS` | ntfy **urgent** (escalation) |
+| Crossing `MAX_BACKUP_AGE_HOURS` | ntfy **urgent** (escalation), noting the suspend if there was one |
 | Still stale after that | ntfy at most every `NOTIFY_REPEAT_HOURS` |
 | A successful backup | nothing — and the streak resets, so the next failure pages again |
 
 State lives in `$CONFIG_DIR/.notify-state` and is deleted on every success.
+
+The suspend row is the one rule that runs *ahead* of this throttle. Closing a
+laptop lid, or suspending by hand, takes the sockets restic is holding with it;
+against an append-only rest-server the retry after the resume re-POSTs a pack
+the server already wrote and is answered `403 Forbidden`, so the run dies of
+nothing but the lid. Nothing is damaged — the packs left with no snapshot
+pointing at them are orphans the maintenance host's prune collects — and the
+next hourly run backs up normally, so the script logs it and says nothing.
+
+The script compares `/sys/power/suspend_stats/success` across the run to tell
+that apart from a backend that genuinely rejected the write. Three things bound
+it, because "stay quiet" is the dangerous direction:
+
+- Past `MAX_BACKUP_AGE_HOURS` the excuse stops counting and the escalation pages
+  as usual, with `Slept: yes` in the body. Without that, a machine asleep
+  through its backup *every* day would go quiet for good.
+- `.notify-state` is deliberately not written, so the next failure — a real one,
+  on a run nothing interrupted — is still the "first failure after a success"
+  that always pushes, rather than a silenced later one in a streak.
+- **Hibernation is not covered.** It takes a different kernel path and sysfs
+  publishes no counter for it, so a hibernated run pages like any other failure.
+  Suspend-to-RAM and s2idle — what a closed lid and `systemctl suspend` do — are
+  what the counter sees.
+
+A host that never suspends never reaches any of this: the counter does not move,
+and neither does the alerting.
 
 A failure *before* the config is loaded — a file that will not parse, wrong
 ownership, a missing `BACKUP_PATHS` — is reported the same way. The ntfy and
@@ -699,7 +726,7 @@ can read a repo given those three, which is why §3.2 matters.
 | ntfy (`urgent`) | First failure after a success; crossing `MAX_BACKUP_AGE_HOURS`; then every `NOTIFY_REPEAT_HOURS` | Success is intentionally silent. Throttled — see §4.3. |
 | Local staleness check | Every invocation, including every skip | The fast alarm: catches a host that is alive but quietly not backing up. |
 | ntfy (`low`) | Once per newly published script version, if this host is behind | Only when `NTFY_TOPIC_LOW` is set; otherwise a log line. Never updates anything — see §10. |
-| healthchecks ping | `/start`, success, `/fail` | The slow alarm: catches a host too dead to alert for itself. Grace period should sit **above** `MAX_BACKUP_AGE_HOURS`. |
+| healthchecks ping | `/start`, success, `/fail` | The slow alarm: catches a host too dead to alert for itself. Grace period should sit **above** `MAX_BACKUP_AGE_HOURS`. No `/fail` for a run the machine slept through — that would just move the page to the DMS (§4.3). |
 | `notify-send` | Failure, desktop only | Best-effort. |
 
 Test the alerting path deliberately — point `RESTIC_REPOSITORY` at a bogus URL
@@ -729,6 +756,8 @@ Then let a real run repair it, or delete `.last-success` to reset.
 | Symptom | Cause |
 |---|---|
 | `401 Unauthorized` | `RESTIC_REST_USERNAME` ≠ first path segment of the repo URL (`--private-repos`), or wrong htpasswd password. |
+| `403 Forbidden` after `connection reset by peer` | The link dropped after a pack was fully sent, so the server wrote it; the retry then re-POSTs a blob that exists and `--append-only` refuses it. Usually a suspend or a tunnel drop mid-upload, not a permissions problem — the same credentials worked seconds earlier. The next run redoes it; prune collects the orphaned packs. |
+| `failed (exit 1) across a suspend; not actionable` | The machine slept mid-backup. Logged, not paged, and retried the next hour — see §4.3. |
 | Timeout / `unreachable` | WireGuard down. `wg show`, then `curl -i http://10.0.0.2:8000/`. |
 | `repository is already locked` | Concurrent maintenance prune. Clients retry for `LOCK_WAIT`; raise it or move the maintenance window. |
 | `Another run has held the lock for …; exiting.` | A previous run is still going (`flock`). Not an error while that time is under `MAX_BACKUP_AGE_HOURS`; past it the holder is treated as wedged and alerts. |

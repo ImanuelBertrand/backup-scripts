@@ -58,6 +58,8 @@ set -euo pipefail
 # A transient failure is logged and retried the next hour;
 # only the first failure after a success, and the crossing of MAX_BACKUP_AGE,
 # page you (see notify_failure) -- 24 invocations a day must not mean 24 pushes.
+# A run the machine SLEPT through is logged and nothing more, on the same
+# threshold: a closed lid is not a fault report, and the next hour picks it up.
 #
 # Run by hand with --force (bypass every gate) or --status (print the decision
 # and report through the exit code, alerting nobody).
@@ -154,6 +156,33 @@ read_epoch() {                         # file -> epoch on stdout, 0 if unusable
     [[ "$v" =~ ^[0-9]+$ ]] || v=0
   fi
   printf '%s' "$v"
+}
+
+# The kernel's tally of completed suspend cycles since boot, or "" where the
+# kernel does not publish one. notify_failure compares it across a run to tell a
+# backup the machine slept through from one the backend actually rejected.
+#
+# Counts suspend-to-RAM and s2idle -- what both a closed lid and `systemctl
+# suspend` do. Hibernation takes a different kernel path and is NOT counted, so
+# a hibernated run still pages: sysfs publishes no counter for it, and it is
+# rare enough on these hosts to leave loud rather than guess at.
+#
+# Never fails and never returns non-zero: it is read from inside the failure
+# path, where a non-zero return under the ERR trap would page about the
+# notification code instead of about the backup.
+suspend_count() {                      # -> count on stdout, "" if unavailable
+  local n=""
+  # Braced so 2>/dev/null covers the `<` as well. Redirections are applied left
+  # to right, so a trailing one is not yet in place to swallow the shell's own
+  # "No such file or directory" -- and a kernel that publishes no counter would
+  # print that into the log on every failure (same ordering as write_state).
+  #
+  # `|| true` rather than `|| n=""`, for read_epoch's reason: read returns 1 at
+  # EOF-without-newline, but only AFTER assigning, so clearing n here would throw
+  # away a counter written without one. The regex below is the real validator.
+  { read -r n < /sys/power/suspend_stats/success; } 2>/dev/null || true
+  [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n"
+  return 0
 }
 
 # read_epoch's counterpart, and the ONLY way this script writes a state file.
@@ -272,6 +301,13 @@ MOUNT_GAP_FILE="$CONFIG_DIR/.mount-gap-state"
 ALERT_AGE_SEC=-1                       # set for real below; safe default for the ERR trap
 NOTIFY_REPEAT_SEC=43200                # 12h, the default; recomputed from the config below
 
+# Read BEFORE anything that can fail, so the window it opens spans the WHOLE
+# run: a suspend during the database dumps breaks the upload that follows just
+# as thoroughly as one during the upload itself, and the ERR trap can fire from
+# anywhere in between. Empty on a kernel without the counter, which
+# notify_failure reads as "did not sleep" and pages about as usual.
+SUSPENDS_AT_START="$(suspend_count)"
+
 # Pull ONE literal setting out of the config without running it. Deliberately
 # narrow: only a single-quoted or double-quoted literal on its own line, with no
 # expansion or substitution in it, is accepted -- anything else needs a shell,
@@ -342,6 +378,9 @@ ntfy() {
 #   - crossing MAX_BACKUP_AGE        -> push once more (escalation)
 #   - beyond that                    -> push at most every NOTIFY_REPEAT_HOURS,
 #                                       or never again if that is 0
+# notify_failure applies one rule ahead of all of these: a failure on a run the
+# machine suspended during is logged only, and reaches neither this throttle nor
+# its state file, while the host is still inside MAX_BACKUP_AGE.
 # Returns 0 if this event should be pushed. Always records the attempt.
 notify_should_push() {
   (( REPORT_ONLY )) && return 1     # never push, and never record an attempt
@@ -639,8 +678,49 @@ version_status() {
 # stale_exit and the lock section.
 notify_failure() {
   local stage="$1" code="$2" output="$3" age="${4:-$ALERT_AGE_SEC}" hard=0 last_txt="never"
-  ping_dms "$PING_URL/fail"
   if (( MAX_AGE_SEC > 0 && age >= MAX_AGE_SEC )); then hard=1; fi
+
+  # Did the machine sleep somewhere inside this run?
+  local susp_now slept=0 susp_note=""
+  susp_now="$(suspend_count)"
+  if [[ -n "$SUSPENDS_AT_START" && -n "$susp_now" ]] && (( susp_now > SUSPENDS_AT_START )); then
+    slept=1
+    susp_note=$'\n''Slept: yes -- the machine suspended during this run'
+  fi
+
+  # A run the machine slept through is not a failure anyone can act on, so it is
+  # logged and left to the hourly grid. Suspend takes the sockets restic is
+  # holding with it, and against an append-only rest-server the retry that
+  # follows the resume re-POSTs a pack the server already wrote and is answered
+  # 403 -- a failure whose whole cause is that the lid closed. Nothing is
+  # damaged: the packs left with no snapshot pointing at them are orphans the
+  # maintenance host's prune collects, and the next hourly run backs up normally.
+  #
+  # Bounded by $hard deliberately. Past MAX_BACKUP_AGE_HOURS the reason stops
+  # mattering -- a host that has not backed up in that long is actionable however
+  # good its excuse -- and without the bound a machine that sleeps through its
+  # backup EVERY day would go quiet permanently, which is the one outcome the
+  # staleness alarm exists to prevent. Above that line the suspend is reported
+  # rather than swallowed: $susp_note puts it in the push, where "and it slept
+  # through all of them" is the diagnosis.
+  #
+  # MAX_BACKUP_AGE_HOURS=0 therefore makes this unbounded, since $hard can never
+  # become 1. That is the documented meaning of 0 -- the local staleness alarm is
+  # off and the external dead-man's switch is the backstop -- and the switch
+  # still catches it: a host that sleeps through every attempt stops pinging
+  # success, which is exactly the silence a DMS is watching for.
+  #
+  # Neither the dead-man's switch nor $NOTIFY_STATE_FILE is touched here.
+  # Pinging /fail would move the page to the DMS instead of retiring it, and
+  # leaving the notify state alone is what keeps the NEXT failure -- a real one,
+  # on a run nothing interrupted -- the "first failure after a success" that
+  # always pushes, rather than a later one in a streak that stays quiet.
+  if (( slept == 1 && hard == 0 )); then
+    log "NOTICE: '$stage' failed (exit $code) across a suspend; not actionable, retrying next hour."
+    return 0
+  fi
+
+  ping_dms "$PING_URL/fail"
   if (( ${LAST_SUCCESS:-0} > 0 )); then last_txt="$(date -d "@$LAST_SUCCESS" '+%Y-%m-%d %H:%M') ($(fmt_age "$ALERT_AGE_SEC") ago)"; fi
   if ! notify_should_push "$hard"; then
     if (( REPORT_ONLY )); then
@@ -658,7 +738,7 @@ notify_failure() {
     "Backup FAILED on $(hostname) ($stage)" \
 "Host:  $(hostname)
 Stage: $stage
-Exit:  $code
+Exit:  $code${susp_note}
 Last good backup: $last_txt
 $(printf '%s' "$output" | tail -c 1500)"
   command -v notify-send >/dev/null 2>&1 \
